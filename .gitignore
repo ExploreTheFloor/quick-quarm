@@ -6,3 +6,4 @@
 !/source/.gitkeep
 /etc/*
 !/etc/.gitkeep
+/.cursor
