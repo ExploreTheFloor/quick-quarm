@@ -11,8 +11,29 @@
 
 <h3>Notes</h3>
 
+<h3>Windows Users - Automated Installation Available!</h3>
+<p>If you're on Windows, we have <b>automated installation scripts</b> that handle everything for you:
 
-<h3>Instructions</h3>
+<ul>
+  <li><b>WSL2 Installation (RECOMMENDED):</b> Uses Windows Subsystem for Linux
+    <ul>
+      <li>Requirements: Windows 10/11 (any edition)
+      <li>Quick Start: Run as Administrator: <code>.\setup\QuarmInstaller.ps1</code>
+      <li>Pros: Faster, lighter weight, easier to manage
+      <li>Cons: Shares resources with Windows
+    </ul>
+  <li><b>Hyper-V VM Installation (ALTERNATIVE):</b> Creates a dedicated Ubuntu VM
+    <ul>
+      <li>Requirements: Windows 10/11 Pro, Enterprise, or Education
+      <li>Quick Start: Run as Administrator: <code>.\setup\QuarmInstaller-HyperV.ps1</code>
+      <li>Pros: Isolated VM, dedicated resources, uses SSH key authentication
+      <li>Cons: Requires more disk space (60GB), Hyper-V not available on Home edition
+    </ul>
+</ul>
+
+<p><b>For manual Linux installation, continue with instructions below:</b>
+
+<h3>Instructions (Linux/Manual)</h3>
 <ul>
   <li>Create an Ubuntu 22.04 LTS WSL2, VM or persistent container (such as LXC).  <i>[have not tested other OSs, WSL2 required several modifications to work]</i>
   <li>Install with any user that has sudo privilege.

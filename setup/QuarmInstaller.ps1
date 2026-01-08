@@ -697,17 +697,65 @@ function Test-QuickQuarmService {
 function Get-HostIP {
     Write-Host "[STEP 3/7] Detecting network configuration..." -ForegroundColor Yellow
     
-    # Get the IPv4 address of the primary network adapter
-    $hostIP = (Get-NetIPAddress -AddressFamily IPv4 | 
-               Where-Object { $_.IPAddress -notmatch '^(127\.|169\.254\.)' } | 
-               Select-Object -First 1).IPAddress
+    # Get physical network adapters (exclude virtual adapters)
+    $adapters = Get-NetAdapter | Where-Object { 
+        $_.Status -eq 'Up' -and 
+        $_.InterfaceDescription -notmatch 'Hyper-V|VirtualBox|VMware|WSL|Loopback|Teredo|isatap' 
+    }
     
+    $hostIP = $null
+    
+    # First pass: Find adapter with default route
+    foreach ($adapter in $adapters) {
+        $ipConfig = Get-NetIPAddress -InterfaceIndex $adapter.ifIndex -AddressFamily IPv4 -ErrorAction SilentlyContinue | 
+                    Where-Object { 
+                        $_.IPAddress -notmatch '^(127\.|169\.254\.)' -and
+                        ($_.IPAddress -match '^192\.168\.|^10\.|^172\.(1[6-9]|2[0-9]|3[0-1])\.')
+                    }
+        
+        if ($ipConfig) {
+            $route = Get-NetRoute -InterfaceIndex $adapter.ifIndex -DestinationPrefix "0.0.0.0/0" -ErrorAction SilentlyContinue
+            if ($route) {
+                $hostIP = $ipConfig.IPAddress
+                Write-Host "  ✓ Detected primary adapter IP: $hostIP" -ForegroundColor Green
+                break
+            }
+        }
+    }
+    
+    # Second pass: Find any private IP on physical adapter
+    if (-not $hostIP) {
+        foreach ($adapter in $adapters) {
+            $ipConfig = Get-NetIPAddress -InterfaceIndex $adapter.ifIndex -AddressFamily IPv4 -ErrorAction SilentlyContinue | 
+                        Where-Object { 
+                            $_.IPAddress -notmatch '^(127\.|169\.254\.)' -and
+                            ($_.IPAddress -match '^192\.168\.|^10\.|^172\.(1[6-9]|2[0-9]|3[0-1])\.')
+                        } | Select-Object -First 1
+            
+            if ($ipConfig) {
+                $hostIP = $ipConfig.IPAddress
+                Write-Host "  ✓ Detected adapter IP: $hostIP" -ForegroundColor Green
+                break
+            }
+        }
+    }
+    
+    # Fallback: Any non-loopback IP
+    if (-not $hostIP) {
+        $hostIP = (Get-NetIPAddress -AddressFamily IPv4 | 
+                   Where-Object { $_.IPAddress -notmatch '^(127\.|169\.254\.)' } | 
+                   Select-Object -First 1).IPAddress
+        
+        if ($hostIP) {
+            Write-Host "  ! Using detected IP: $hostIP (may be virtual adapter)" -ForegroundColor Yellow
+        }
+    }
+    
+    # Final fallback
     if (-not $hostIP) {
         $hostIP = "192.168.1.100"
         Write-Host "  ! Could not detect IP, using default: $hostIP" -ForegroundColor Yellow
-    }
-    else {
-        Write-Host "  ✓ Detected host IP: $hostIP" -ForegroundColor Green
+        Write-Host "    You may need to manually update the login server configuration" -ForegroundColor Yellow
     }
     
     return $hostIP
@@ -1069,13 +1117,14 @@ EOF' 2>&1 | Out-Null
     Write-Host "=========================================" -ForegroundColor Green
     Write-Host ""
     Write-Host "Quick Quarm server details:" -ForegroundColor Cyan
-    Write-Host "  Server IP: $safeHostIP:6000" -ForegroundColor White
+    $serverAddr = "$safeHostIP" + ":6000"
+    Write-Host "  Server IP: $serverAddr" -ForegroundColor White
     Write-Host "  Database: $safeDBName" -ForegroundColor White
     Write-Host "  DB User: $safeDBUser" -ForegroundColor White
     Write-Host ""
     Write-Host "Next steps:" -ForegroundColor Cyan
     Write-Host "1. Download TAKP v2.2 Client from PQ Discord #server-files" -ForegroundColor White
-    Write-Host "2. Edit eqhost.txt and change server to: $safeHostIP:6000" -ForegroundColor White
+    Write-Host "2. Edit eqhost.txt and change server to: $serverAddr" -ForegroundColor White
     Write-Host "3. Run the client and login with any username/password" -ForegroundColor White
     Write-Host "4. Select your Quick Quarm server and create a character" -ForegroundColor White
     Write-Host "5. To grant GM powers: cd ~/quick-quarm && ./scripts/eq/makegm -l LOGINACCOUNT" -ForegroundColor White
@@ -1187,11 +1236,12 @@ try {
     Write-Host "========================================" -ForegroundColor Green
     Write-Host ""
     Write-Host "Your Quick Quarm server is now running in WSL2!" -ForegroundColor Cyan
-    Write-Host "Server IP: $hostIP" -ForegroundColor Cyan
+    $serverAddress = "$hostIP" + ":6000"
+    Write-Host "Server IP: $serverAddress" -ForegroundColor Cyan
     Write-Host ""
     Write-Host "Next steps:" -ForegroundColor White
     Write-Host "  1. Download TAKP v2.2 Client from PQ Discord #server-files" -ForegroundColor Gray
-    Write-Host "  2. Edit eqhost.txt and change server to: $hostIP:6000" -ForegroundColor Gray
+    Write-Host "  2. Edit eqhost.txt and change server to: $serverAddress" -ForegroundColor Gray
     Write-Host "  3. Run the client and login with any username/password" -ForegroundColor Gray
     Write-Host "  4. Select your Quick Quarm server and create a character" -ForegroundColor Gray
     Write-Host "  5. To grant GM powers: wsl -d Ubuntu-22.04" -ForegroundColor Gray

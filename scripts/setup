@@ -70,7 +70,7 @@ PUBLIC=$(read_input "Public server (y/N)" "$PUBLIC")
 if [[ "$PUBLIC" =~ [Yy] ]]; then 
     PUBLICIP=$(read_input "Public address" "$PUBLICIP")
 else
-    PUBLICIP=''
+    PUBLICIP=$HOSTIP
 fi
 
 if [ "$OPT_DEBUG" = true ]; then 

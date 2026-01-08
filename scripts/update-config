@@ -14,13 +14,12 @@ fi
 
 export LAUNCHEREXE="$BINDIR/zone"
 
-if [ -z "$PUBLICIP" ]; then
-    export PUBLICIP=$HOSTIP
-fi
-
 log "CONFIG" "Updating eqemu_config.json"
 exec_cmd_as $QQUSER "envsubst < $TEMPLATE_EQEMUCONFIG > $BINDIR/eqemu_config.json"
 
 log "CONFIG" "Updating login.json"
 exec_cmd_as $QQUSER "envsubst < $TEMPLATE_LOGININI > $BINDIR/login.json"
+
+log "CONFIG" "Fixing world server IP in database"
+mysql_exec_as $QQUSER "UPDATE tblWorldServerRegistration SET ServerLastIPAddr = '$HOSTIP' WHERE ServerShortName = 'QuickQuarm' AND ServerLastIPAddr != '$HOSTIP'" "retrc"
 
