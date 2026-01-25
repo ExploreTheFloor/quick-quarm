@@ -191,27 +191,18 @@ echo.
 echo WARNING: This will COMPLETELY REMOVE Quick Quarm!
 echo All data and configurations will be deleted!
 echo.
-set /p confirm="Are you sure you want to UNINSTALL? (yes/no): "
-if /i "%confirm%"=="yes" (
+set /p confirm="Type UNINSTALL to confirm: "
+if /i %confirm%==UNINSTALL (
     echo.
-    set /p doublecheck="Type UNINSTALL to confirm: "
-    if /i "%doublecheck%"=="UNINSTALL" (
-        echo.
-        echo Launching uninstaller with Administrator privileges...
-        echo You may see a UAC prompt - please click Yes.
-        echo.
-        powershell -Command "Start-Process powershell -ArgumentList '-ExecutionPolicy Bypass -File \"%~dp0QuarmUninstaller.ps1\"' -Verb RunAs -Wait"
-        echo.
-        pause
-    ) else (
-        echo.
-        echo Uninstall cancelled - confirmation text did not match.
-        echo.
-        pause
-    )
+    echo Launching uninstaller with Administrator privileges...
+    echo You may see a UAC prompt - please click Yes.
+    echo.
+    powershell -Command "Start-Process powershell -ArgumentList '-ExecutionPolicy Bypass -File \"%~dp0QuarmUninstaller.ps1\"' -Verb RunAs -Wait"
+    echo.
+    pause
 ) else (
     echo.
-    echo Uninstall cancelled.
+    echo Uninstall cancelled - confirmation text did not match.
     echo.
     pause
 )

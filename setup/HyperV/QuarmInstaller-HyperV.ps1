@@ -747,9 +747,11 @@ echo "Server IP: {VMIPADDRESS}:6000"
     $installScript = $installScript -replace '\{DBPASSWORD\}', $DBPassword
     $installScript = $installScript -replace '\{VMIPADDRESS\}', $ActualVMIP
     
-    # Save script to temp file
+    # Save script to temp file with Unix line endings (LF only)
     $scriptPath = [System.IO.Path]::GetTempFileName() + ".sh"
-    $installScript | Out-File -FilePath $scriptPath -Encoding ASCII -NoNewline
+    # Convert to Unix line endings (LF only) and save as UTF-8 without BOM
+    $installScript = $installScript -replace "`r`n", "`n" -replace "`r", "`n"
+    [System.IO.File]::WriteAllText($scriptPath, $installScript, [System.Text.UTF8Encoding]::new($false))
     
     # Copy script to VM (using port if specified)
     Write-Host "  - Copying installation script to VM..." -ForegroundColor Gray
@@ -843,6 +845,9 @@ try {
     
     # Install Quick Quarm via SSH
     Install-QuickQuarmViaSSH -VMIPAddress $sshConnection -ActualVMIP $vmActualIP -Username $InstallUser -PrivateKeyPath $sshKeyPath -RepoUrl $RepoUrl -DBHost $DBHost -DBName $DBName -DBUser $DBUser -DBPassword $DBPassword
+    
+    # Verify installation
+    & "$PSScriptRoot\verify-install.ps1" -VMIP $vmActualIP -SSHKeyPath $sshKeyPath -Username $InstallUser -DBUser $DBUser -DBPassword $DBPassword
     
     # Final output
     Write-Host ""

@@ -7,6 +7,162 @@ param(
     [string]$Action
 )
 
+# Prefer the Windows host LAN IP (not Default Switch).
+function Get-WindowsHostIPv4 {
+    # Try method 1: Get adapter with default gateway (most reliable)
+    try {
+        $cfg = Get-NetIPConfiguration | Where-Object {
+            $_.IPv4DefaultGateway -and
+            $_.NetAdapter -and
+            $_.NetAdapter.Status -eq "Up" -and
+            $_.InterfaceAlias -notlike "*Default Switch*"
+        } | Select-Object -First 1
+
+        if ($cfg -and $cfg.IPv4Address -and $cfg.IPv4Address.IPAddress) {
+            return $cfg.IPv4Address.IPAddress
+        }
+    } catch { }
+
+    # Try method 2: Get first valid private IP (not loopback, not APIPA, not Default Switch)
+    try {
+        $ip = Get-NetIPAddress -AddressFamily IPv4 | Where-Object {
+            $_.IPAddress -notmatch '^(127\.|169\.254\.)' -and
+            ($_.IPAddress -match '^192\.168\.|^10\.|^172\.(1[6-9]|2[0-9]|3[0-1])\.') -and
+            $_.InterfaceAlias -notlike "*Default Switch*" -and
+            $_.IPAddress -notmatch '^172\.18\.'
+        } | Select-Object -First 1
+
+        if ($ip -and $ip.IPAddress) {
+            return $ip.IPAddress
+        }
+    } catch { }
+
+    return $null
+}
+
+# Function to detect VM IP by scanning Default Switch subnet
+function Get-VMIPAddress {
+    param(
+        [string]$VMName,
+        [int]$TimeoutSeconds = 120
+    )
+    
+    Write-Host "  - Detecting VM IP address (this may take 1-2 minutes)..." -ForegroundColor Gray
+    
+    # Method 1: Try to get IP from Hyper-V integration services
+    $vmNetAdapter = Get-VMNetworkAdapter -VMName $VMName -ErrorAction SilentlyContinue
+    if ($vmNetAdapter -and $vmNetAdapter.IPAddresses) {
+        $reportedIP = $vmNetAdapter.IPAddresses | Where-Object { $_ -match '^\d+\.\d+\.\d+\.\d+$' } | Select-Object -First 1
+        
+        if ($reportedIP) {
+            Write-Host "  - Hyper-V reports IP: $reportedIP (verifying SSH access...)" -ForegroundColor Gray
+            
+            # Verify SSH is actually accessible
+            try {
+                $tcpClient = New-Object System.Net.Sockets.TcpClient
+                $connect = $tcpClient.BeginConnect($reportedIP, 22, $null, $null)
+                $wait = $connect.AsyncWaitHandle.WaitOne(2000, $false)
+                
+                if ($wait) {
+                    try {
+                        $tcpClient.EndConnect($connect)
+                        $tcpClient.Close()
+                        Write-Host "  + Found VM at reported IP: $reportedIP" -ForegroundColor Green
+                        return $reportedIP
+                    }
+                    catch {
+                        $tcpClient.Close()
+                    }
+                }
+                else {
+                    $tcpClient.Close()
+                }
+            }
+            catch {
+                # SSH not responding on reported IP
+            }
+            
+            Write-Host "  - Reported IP not responding to SSH, scanning subnet..." -ForegroundColor Yellow
+        }
+    }
+    
+    # Method 2: Scan Default Switch subnet for VM
+    $defaultSwitchIP = Get-NetIPAddress -InterfaceAlias "vEthernet (Default Switch)" -AddressFamily IPv4 -ErrorAction SilentlyContinue
+    if (-not $defaultSwitchIP) {
+        Write-Host "  ! Could not detect Default Switch IP" -ForegroundColor Red
+        return $null
+    }
+    
+    $hostIP = $defaultSwitchIP.IPAddress
+    $prefixLength = $defaultSwitchIP.PrefixLength
+    
+    # Calculate subnet range based on prefix length
+    $ipBytes = [System.Net.IPAddress]::Parse($hostIP).GetAddressBytes()
+    $ipInt = [System.BitConverter]::ToUInt32($ipBytes[3..0], 0)
+    
+    $maskInt = [Convert]::ToUInt32(("1" * $prefixLength).PadRight(32, "0"), 2)
+    $networkInt = $ipInt -band $maskInt
+    $broadcastInt = $networkInt -bor (-bnot $maskInt)
+    
+    Write-Host "  - Scanning /$prefixLength subnet for VM..." -ForegroundColor Gray
+    
+    $elapsed = 0
+    $scanInterval = 15
+    $scansPerformed = 0
+    
+    while ($elapsed -lt $TimeoutSeconds) {
+        $scansPerformed++
+        
+        # Scan IP range from network+2 to broadcast-1 (skip network and broadcast addresses)
+        for ($ipToTest = $networkInt + 2; $ipToTest -lt $broadcastInt; $ipToTest++) {
+            # Convert back to IP address
+            $bytes = [System.BitConverter]::GetBytes($ipToTest)
+            $testIP = [System.Net.IPAddress]::new($bytes[3..0]).ToString()
+            
+            # Skip the host IP itself
+            if ($testIP -eq $hostIP) { continue }
+            
+            # Quick TCP connect test to port 22
+            try {
+                $tcpClient = New-Object System.Net.Sockets.TcpClient
+                $connect = $tcpClient.BeginConnect($testIP, 22, $null, $null)
+                $wait = $connect.AsyncWaitHandle.WaitOne(50, $false)
+                
+                if ($wait) {
+                    try {
+                        $tcpClient.EndConnect($connect)
+                        $tcpClient.Close()
+                        Write-Host "  + Found VM at IP: $testIP" -ForegroundColor Green
+                        return $testIP
+                    }
+                    catch {
+                        $tcpClient.Close()
+                    }
+                }
+                else {
+                    $tcpClient.Close()
+                }
+            }
+            catch {
+                # Ignore connection errors
+            }
+        }
+        
+        if ($scansPerformed -eq 1) {
+            Write-Host "  - First scan complete, no VM found. VM may still be booting..." -ForegroundColor Yellow
+            Write-Host "  - Waiting and rescanning... ($scanInterval seconds)" -ForegroundColor Gray
+        } else {
+            Write-Host "  - Rescanning subnet... (elapsed: $elapsed/${TimeoutSeconds}s)" -ForegroundColor Gray
+        }
+        
+        Start-Sleep -Seconds $scanInterval
+        $elapsed += $scanInterval
+    }
+    
+    Write-Host "  ! Could not detect VM IP address after ${TimeoutSeconds}s" -ForegroundColor Red
+    return $null
+}
+
 # Check if running as Administrator (required for Fix and Undo)
 $isAdmin = ([Security.Principal.WindowsPrincipal] [Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
 
@@ -66,18 +222,40 @@ switch ($Action) {
         $vmIP = $null
         try {
             if ($vm -and $vm.State -eq "Running") {
+                # Try quick check first (no scanning)
                 $vmNetAdapter = Get-VMNetworkAdapter -VMName "QuickQuarm" -ErrorAction SilentlyContinue
                 if ($vmNetAdapter -and $vmNetAdapter.IPAddresses) {
                     $vmIP = $vmNetAdapter.IPAddresses | Where-Object { $_ -match '^\d+\.\d+\.\d+\.\d+$' } | Select-Object -First 1
-                    if ($vmIP) {
-                        Write-Host "  [PASS] VM IP: $vmIP" -ForegroundColor Green
-                    } else {
-                        $issues += "VM has no IPv4 address assigned"
-                        Write-Host "  [FAIL] VM has no IPv4 address" -ForegroundColor Red
+                }
+                
+                if ($vmIP) {
+                    Write-Host "  [INFO] Hyper-V reports IP: $vmIP" -ForegroundColor Cyan
+                    
+                    # Verify it's actually accessible
+                    try {
+                        $testConnection = Test-NetConnection -ComputerName $vmIP -Port 22 -WarningAction SilentlyContinue -ErrorAction SilentlyContinue -InformationLevel Quiet
+                        if ($testConnection) {
+                            Write-Host "  [PASS] VM IP verified: $vmIP" -ForegroundColor Green
+                        } else {
+                            Write-Host "  [WARN] VM IP reported but not accessible: $vmIP" -ForegroundColor Yellow
+                            $warnings += "VM IP $vmIP is not responding to connections"
+                        }
+                    } catch {
+                        Write-Host "  [WARN] Could not verify VM IP: $vmIP" -ForegroundColor Yellow
                     }
                 } else {
-                    $issues += "Could not get VM network adapter information"
-                    Write-Host "  [FAIL] Could not get VM network info" -ForegroundColor Red
+                    Write-Host "  [INFO] Hyper-V has not reported an IP yet" -ForegroundColor Cyan
+                    Write-Host "  [INFO] Attempting network scan..." -ForegroundColor Cyan
+                    
+                    # Try network scanning (with short timeout for diagnostics)
+                    $vmIP = Get-VMIPAddress -VMName "QuickQuarm" -TimeoutSeconds 30
+                    
+                    if ($vmIP) {
+                        Write-Host "  [PASS] VM IP found via scan: $vmIP" -ForegroundColor Green
+                    } else {
+                        $issues += "VM has no IPv4 address or is not responding to network probes"
+                        Write-Host "  [FAIL] Could not detect VM IP" -ForegroundColor Red
+                    }
                 }
             } else {
                 Write-Host "  [SKIP] VM is not running" -ForegroundColor Yellow
@@ -90,23 +268,17 @@ switch ($Action) {
         # 3. Get Windows host IP address
         Write-Host "[3/8] Getting Windows host IP address..." -ForegroundColor Yellow
         try {
-            $hostIP = (Get-NetIPAddress -AddressFamily IPv4 | 
-                       Where-Object { 
-                           $_.IPAddress -notmatch '^(127\.|169\.254\.)' -and
-                           ($_.IPAddress -match '^192\.168\.|^10\.|^172\.(1[6-9]|2[0-9]|3[0-1])\.')
-                       } | Select-Object -First 1).IPAddress
+            $hostIP = Get-WindowsHostIPv4
             
             if ($hostIP) {
                 Write-Host "  [PASS] Windows host IP: $hostIP" -ForegroundColor Green
             } else {
                 $warnings += "Could not determine Windows host IP"
                 Write-Host "  [WARN] Could not detect host IP" -ForegroundColor Yellow
-                $hostIP = "192.168.1.100"
             }
         } catch {
             $warnings += "Failed to get Windows host IP: $($_.Exception.Message)"
             Write-Host "  [WARN] Error getting host IP" -ForegroundColor Yellow
-            $hostIP = "192.168.1.100"
         }
 
         # 4. Check if SSH is accessible
@@ -295,18 +467,32 @@ switch ($Action) {
             if ($vm.State -ne "Running") {
                 Write-Host "  [INFO] Starting VM..." -ForegroundColor Cyan
                 Start-VM -Name "QuickQuarm"
-                Start-Sleep -Seconds 10
+                Write-Host "  [INFO] Waiting for VM to boot (this takes 1-2 minutes)..." -ForegroundColor Cyan
+                Start-Sleep -Seconds 30
+            } else {
+                Write-Host "  [INFO] VM is already running" -ForegroundColor Cyan
             }
 
-            $vmNetAdapter = Get-VMNetworkAdapter -VMName "QuickQuarm" -ErrorAction SilentlyContinue
-            $vmIP = $null
-            if ($vmNetAdapter -and $vmNetAdapter.IPAddresses) {
-                $vmIP = $vmNetAdapter.IPAddresses | Where-Object { $_ -match '^\d+\.\d+\.\d+\.\d+$' } | Select-Object -First 1
-            }
+            # Use robust IP detection with network scanning
+            $vmIP = Get-VMIPAddress -VMName "QuickQuarm" -TimeoutSeconds 120
             
             if (-not $vmIP) {
-                Write-Host "  [FAIL] Could not get VM IP address" -ForegroundColor Red
-                Write-Host "  Make sure the VM is running and has a network connection" -ForegroundColor Yellow
+                Write-Host ""
+                Write-Host "  [FAIL] Could not detect VM IP address" -ForegroundColor Red
+                Write-Host "" -ForegroundColor Yellow
+                Write-Host "  Possible causes:" -ForegroundColor Yellow
+                Write-Host "    - VM is still booting (cloud-init takes 3-5 minutes on first boot)" -ForegroundColor Yellow
+                Write-Host "    - SSH service hasn't started yet" -ForegroundColor Yellow
+                Write-Host "    - Network configuration failed" -ForegroundColor Yellow
+                Write-Host ""
+                Write-Host "  Troubleshooting:" -ForegroundColor Cyan
+                Write-Host "    1. Wait 5 more minutes and try again" -ForegroundColor White
+                Write-Host "    2. Check VM console in Hyper-V Manager:" -ForegroundColor White
+                Write-Host "       - Open Hyper-V Manager" -ForegroundColor Gray
+                Write-Host "       - Right-click 'QuickQuarm' -> Connect" -ForegroundColor Gray
+                Write-Host "       - Check if VM is at login prompt or showing errors" -ForegroundColor Gray
+                Write-Host "    3. Run diagnostic: .\Diagnose-VMNetwork.ps1" -ForegroundColor White
+                Write-Host ""
                 exit 1
             }
             
@@ -391,11 +577,7 @@ switch ($Action) {
         # Get Windows host IP
         Write-Host ""
         Write-Host "Getting Windows host IP address..." -ForegroundColor Yellow
-        $hostIP = (Get-NetIPAddress -AddressFamily IPv4 | 
-                   Where-Object { 
-                       $_.IPAddress -notmatch '^(127\.|169\.254\.)' -and
-                       ($_.IPAddress -match '^192\.168\.|^10\.|^172\.(1[6-9]|2[0-9]|3[0-1])\.')
-                   } | Select-Object -First 1).IPAddress
+        $hostIP = Get-WindowsHostIPv4
 
         # Summary
         Write-Host ""

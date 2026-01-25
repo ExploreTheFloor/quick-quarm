@@ -10,6 +10,37 @@ param(
 $VMName = "QuickQuarm"
 $SSHKeyPath = "C:\Users\Laptop\QuickQuarm-VM\id_rsa"
 
+function Get-WindowsHostIPv4 {
+    try {
+        $cfg = Get-NetIPConfiguration | Where-Object {
+            $_.IPv4DefaultGateway -and
+            $_.NetAdapter -and
+            $_.NetAdapter.Status -eq "Up" -and
+            -not $_.NetAdapter.Virtual -and
+            $_.NetAdapter.InterfaceAlias -notlike "vEthernet*"
+        } | Select-Object -First 1
+
+        if ($cfg -and $cfg.IPv4Address -and $cfg.IPv4Address.IPAddress) {
+            return $cfg.IPv4Address.IPAddress
+        }
+    } catch { }
+
+    try {
+        $ip = Get-NetIPAddress -AddressFamily IPv4 | Where-Object {
+            $_.IPAddress -notmatch '^(127\.|169\.254\.)' -and
+            ($_.IPAddress -match '^192\.168\.|^10\.|^172\.(1[6-9]|2[0-9]|3[0-1])\.') -and
+            $_.InterfaceAlias -notlike "vEthernet*" -and
+            $_.InterfaceDescription -notmatch 'Hyper-V'
+        } | Select-Object -First 1
+
+        if ($ip -and $ip.IPAddress) {
+            return $ip.IPAddress
+        }
+    } catch { }
+
+    return $null
+}
+
 # Check if VM exists
 $vm = Get-VM -Name $VMName -ErrorAction SilentlyContinue
 if (-not $vm -and $Action -ne "Status") {
@@ -135,6 +166,16 @@ switch ($Action) {
             } else {
                 Write-Host "  IP Address: Not available" -ForegroundColor Yellow
             }
+        }
+        Write-Host ""
+
+        $hostIP = Get-WindowsHostIPv4
+        if ($hostIP) {
+            Write-Host "Windows Host IP: $hostIP" -ForegroundColor Cyan
+            Write-Host "Client should connect to: $hostIP:6000" -ForegroundColor Cyan
+        } else {
+            Write-Host "Windows Host IP: (could not detect)" -ForegroundColor Yellow
+            Write-Host "Client should connect to: <YOUR_HOST_IP>:6000" -ForegroundColor Yellow
         }
         Write-Host ""
         

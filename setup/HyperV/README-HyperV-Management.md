@@ -94,7 +94,52 @@ This directory contains PowerShell scripts for managing your Quick Quarm Hyper-V
 
 ---
 
-### 4. QuarmUninstaller-HyperV.ps1
+### 4. Check-ShutdownCause.ps1
+**Purpose:** Diagnose why the server is shutting down
+
+**Usage:**
+```powershell
+# Run as Administrator
+.\Check-ShutdownCause.ps1
+```
+
+**When to use:**
+- Before applying fixes, to understand the problem
+- Server keeps shutting down for unknown reasons
+- Want to see VM uptime and service status
+
+**What it shows:**
+- VM uptime and last shutdown time
+- Power management status
+- Service status and recent failures
+- System logs for shutdown events
+- Memory and disk usage
+
+---
+
+### 5. Fix-AutoShutdown.ps1
+**Purpose:** Fix server automatically shutting down when idle
+
+**Usage:**
+```powershell
+# Run as Administrator
+.\Fix-AutoShutdown.ps1
+```
+
+**When to use:**
+- Server shuts down after being idle for a while
+- VM suspends or hibernates unexpectedly
+- Services stop running on their own
+
+**What it does:**
+- Disables Ubuntu power management (suspend/hibernate)
+- Configures systemd to restart services automatically if they crash
+- Disables idle timeout shutdowns
+- Ignores ACPI power button events
+
+---
+
+### 6. QuarmUninstaller-HyperV.ps1
 **Purpose:** Complete removal of Quick Quarm VM
 
 **Usage:**
@@ -117,7 +162,10 @@ This directory contains PowerShell scripts for managing your Quick Quarm Hyper-V
 
 ### First Time Setup
 ```powershell
-# 1. Install Quick Quarm
+# 1. Install Quick Quarm (with static IP recommended)
+.\QuarmInstaller-HyperV.ps1 -UseStaticIP
+
+# OR with DHCP (not recommended for long-running VMs)
 .\QuarmInstaller-HyperV.ps1
 
 # 2. Wait for installation to complete (15-25 minutes)
@@ -154,6 +202,12 @@ This directory contains PowerShell scripts for managing your Quick Quarm Hyper-V
 
 # Inside VM, check services:
 systemctl status quick-quarm.target
+
+# Check why server is shutting down
+.\Check-ShutdownCause.ps1
+
+# Fix server shutting down when idle
+.\Fix-AutoShutdown.ps1
 ```
 
 ### Reinstalling
@@ -193,6 +247,25 @@ The VM uses Hyper-V's network switches (in priority order):
    - VM-to-host only, no internet
    - Not recommended
 
+### Static IP vs DHCP
+
+**DHCP (Default):**
+- ❌ DHCP leases expire after hours/days of inactivity
+- ❌ VM may lose connectivity when sitting idle
+- ❌ Port forwarding breaks when IP changes
+- ✅ Slightly easier initial setup
+
+**Static IP (Recommended):**
+- ✅ IP never changes or expires
+- ✅ VM stays accessible after long idle periods
+- ✅ Port forwarding remains stable
+- ✅ Better for 24/7 servers
+
+**Install with Static IP:**
+```powershell
+.\QuarmInstaller-HyperV.ps1 -UseStaticIP
+```
+
 Port forwarding maps host ports to VM:
 - `0.0.0.0:6000` → `VM:6000` (Login Server - UDP)
 - `0.0.0.0:5998` → `VM:5998` (Login Server - TCP)
@@ -226,6 +299,9 @@ Port forwarding maps host ports to VM:
 - **Slow Performance:** Increase VM memory in Hyper-V Manager
 - **Can't SSH:** Check that SSH key exists in `C:\Users\Laptop\QuickQuarm-VM\id_rsa`
 - **Port Forwarding Lost:** Run `.\Connection-HyperV.ps1 -Action Fix` after VM restarts
+- **VM Stops/Loses Connection After Idle:** Reinstall with `-UseStaticIP` flag to prevent DHCP lease expiration
+- **Server Shuts Down When Idle:** Run `.\Fix-AutoShutdown.ps1` to disable power management
+- **Use Static IP for Stability:** Always use `-UseStaticIP` when installing if VM will run 24/7 or sit idle for long periods
 
 ---
 

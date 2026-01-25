@@ -18,7 +18,7 @@ This automated PowerShell script creates a Hyper-V virtual machine with Ubuntu 2
 2. Navigate to the Quick Quarm directory
 3. Run:
    ```powershell
-   .\setup\QuarmInstaller-HyperV.ps1
+   .\setup\HyperV\QuarmInstaller-HyperV.ps1
    ```
 
 The script will:
@@ -38,7 +38,7 @@ The script will:
 You can customize the installation with parameters:
 
 ```powershell
-.\setup\QuarmInstaller-HyperV.ps1 `
+.\setup\HyperV\QuarmInstaller-HyperV.ps1 `
   -VMName "MyQuarmServer" `
   -VMMemory 8GB `
   -VMProcessors 4 `
@@ -62,6 +62,11 @@ You can customize the installation with parameters:
 | `DBName` | `quarm` | Database name |
 | `DBUser` | `quarm` | Database username |
 | `DBPassword` | `quarm` | Database password |
+| `UseStaticIP` | `$true` | Use static IP instead of DHCP (auto-detected) |
+| `StaticIP` | Auto-detected | Static IP address (auto-detected from Default Switch) |
+| `StaticGateway` | Auto-detected | Gateway for static IP (auto-detected) |
+| `StaticSubnetMask` | `20` | CIDR notation (20 for Default Switch, 24 for LANs) |
+| `StaticDNS` | `8.8.8.8,8.8.4.4` | DNS servers (comma-separated) |
 
 ## What Gets Installed
 
@@ -81,11 +86,34 @@ You can customize the installation with parameters:
 ## Network Configuration
 
 The script will:
-1. Look for an existing external Hyper-V switch
-2. Create an external switch if none exists (using your first physical network adapter)
-3. If no physical adapter is available, create an internal switch
+1. Look for the Default Switch (best for Wi-Fi/laptop setups)
+2. Look for an existing external Hyper-V switch
+3. Create an external switch if none exists (using your first physical network adapter)
+4. If no physical adapter is available, create an internal switch
 
-The VM will obtain an IP address via DHCP from your network.
+### DHCP vs Static IP
+
+**By default, the VM uses DHCP**, which can cause connectivity issues:
+- **DHCP leases expire** if the VM sits idle for extended periods
+- The VM may lose network connectivity and require reconfiguration
+- Port forwarding may break when the IP changes
+
+**Default behavior:** Uses static IP (auto-detected from your LAN or Default Switch)
+
+**To use DHCP instead (not recommended):**
+```powershell
+.\setup\HyperV\QuarmInstaller-HyperV.ps1 -UseStaticIP:$false
+```
+
+**To override with custom static IP:**
+```powershell
+.\setup\HyperV\QuarmInstaller-HyperV.ps1 `
+  -StaticIP "172.16.0.100" `
+  -StaticGateway "172.16.0.1" `
+  -StaticSubnetMask "20"
+```
+
+**Note:** For Default Switch, use subnet mask `20` (default). For most LANs, use `24`.
 
 ## SSH Access
 
@@ -151,7 +179,8 @@ journalctl -u quick-quarm.target -f
 1. Download TAKP v2.2 Client from Project Quarm Discord (#server-files)
 2. Install to a separate folder from your main PQ installation
 3. Edit `eqhost.txt` file in the client directory
-4. Change the line to: `<VM_IP>:6000` (replace `<VM_IP>` with the actual VM IP address shown at installation end)
+4. Change the line to: `<VM_IP>:6000` (use the VM IP address shown at end of installation)
+5. The VM IP is the address to use - NOT your Windows host IP
 5. Run the client
 6. Login with any username/password
 7. Select your Quick Quarm server and create a character
@@ -168,9 +197,18 @@ Then in-game, type `/sit` and `/camp login`, then log back in to activate GM pow
 
 ## Troubleshooting
 
+### Network / IP Detection Issues
+
+**Error:** "Could not get VM IP address"
+
+The installer now automatically scans the network to find your VM. If it still fails:
+1. **Wait 5 minutes** - First boot takes 3-5 minutes for cloud-init
+2. **Run:** `.\Connection-HyperV.ps1 -Action Fix` (it will scan the network)
+3. **Run diagnostics:** `.\Diagnose-VMNetwork.ps1`
+
 ### Hyper-V Not Available
 **Error:** "Hyper-V is not available"
-**Solution:** You need Windows 10/11 Pro, Enterprise, or Education. Home edition does not support Hyper-V. Consider using the WSL2 installer instead (`QuarmInstaller.ps1`).
+**Solution:** You need Windows 10/11 Pro, Enterprise, or Education. Home edition does not support Hyper-V. Consider using the WSL2 installer instead (`.\setup\WSL\QuarmInstaller.ps1`).
 
 ### VM Won't Start
 **Check:**
@@ -179,11 +217,10 @@ Then in-game, type `/sit` and `/camp login`, then log back in to activate GM pow
 3. View VM logs in Hyper-V Manager
 
 ### SSH Connection Fails
-**Check:**
 1. VM is running: `Get-VM -Name QuickQuarm`
 2. Get VM IP: `Get-VMNetworkAdapter -VMName QuickQuarm | Select-Object IPAddresses`
 3. Test SSH port: `Test-NetConnection -ComputerName <VM_IP> -Port 22`
-4. Verify SSH key path exists: `Test-Path "$env:USERPROFILE\QuickQuarm-VM\id_rsa"`
+4. Run diagnostics: `.\Diagnose-VMNetwork.ps1`
 
 ### Installation Fails
 **Check:**
@@ -199,6 +236,36 @@ Then in-game, type `/sit` and `/camp login`, then log back in to activate GM pow
 2. Services are running: `ssh -i "$env:USERPROFILE\QuickQuarm-VM\id_rsa" root@<VM_IP> "sudo systemctl status quick-quarm.target"`
 3. Verify eqhost.txt has correct IP and port
 4. Ensure client is run as Administrator
+
+### VM Stops or Loses Connectivity After Sitting Idle
+**Problem:** VM stops responding or loses network connection after being idle for hours/days.
+
+**Causes:**
+1. **DHCP lease expiration** - Most common cause
+2. **Automatic shutdown settings**
+3. **Host power management**
+
+**Solutions:**
+
+1. **Static IP is now the default** - New installations automatically use static IP
+
+2. **Verify automatic shutdown settings**:
+   ```powershell
+   # Should show "Save" not "ShutDown"
+   Get-VM -Name QuickQuarm | Select-Object AutomaticStopAction
+   
+   # If not set to Save, fix it:
+   Set-VM -Name QuickQuarm -AutomaticStopAction Save
+   ```
+
+3. **Check port forwarding** (for Default Switch):
+   ```powershell
+   # View current port forwards
+   netsh interface portproxy show v4tov4
+   
+   # If missing, use Connection-HyperV.ps1 to fix
+   .\setup\HyperV\Connection-HyperV.ps1 -Action Fix
+   ```
 
 ## File Locations
 

@@ -16,7 +16,7 @@ if (-not $isAdmin) {
     Write-Host "  1. Right-click on PowerShell" -ForegroundColor White
     Write-Host "  2. Select 'Run as Administrator'" -ForegroundColor White
     Write-Host "  3. Navigate to this directory and run:" -ForegroundColor White
-    Write-Host "     .\setup\fix-port-forwarding.ps1" -ForegroundColor Cyan
+    Write-Host "     .\setup\WSL\fix-port-forwarding.ps1" -ForegroundColor Cyan
     Write-Host ""
     exit 1
 }

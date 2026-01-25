@@ -22,4 +22,3 @@ exec_cmd_as $QQUSER "envsubst < $TEMPLATE_LOGININI > $BINDIR/login.json"
 
 log "CONFIG" "Fixing world server IP in database"
 mysql_exec_as $QQUSER "UPDATE tblWorldServerRegistration SET ServerLastIPAddr = '$HOSTIP' WHERE ServerShortName = 'QuickQuarm' AND ServerLastIPAddr != '$HOSTIP'" "retrc"
-

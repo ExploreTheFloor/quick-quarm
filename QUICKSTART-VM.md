@@ -26,7 +26,7 @@ cd D:\Code\GameSpecific\Everquest\quick-quarm
 ### Step 3: Run the Installer
 
 ```powershell
-.\setup\QuarmInstaller-HyperV.ps1
+.\setup\HyperV\QuarmInstaller-HyperV.ps1
 ```
 
 ### Step 4: Wait for Installation
@@ -134,7 +134,7 @@ sudo systemctl status quick-quarm.target
 You can customize the VM configuration:
 
 ```powershell
-.\setup\QuarmInstaller-HyperV.ps1 `
+.\setup\HyperV\QuarmInstaller-HyperV.ps1 `
   -VMName "MyCustomName" `
   -VMMemory 8GB `
   -VMProcessors 4 `
@@ -148,7 +148,7 @@ You can customize the VM configuration:
 
 **Solution:** You need Windows Pro/Enterprise/Education. Home edition doesn't support Hyper-V. Use the WSL2 installer instead:
 ```powershell
-.\setup\QuarmInstaller.ps1
+.\setup\WSL\QuarmInstaller.ps1
 ```
 
 ### "Script requires Administrator"
@@ -234,7 +234,7 @@ choco uninstall qemu-img xorriso -y
 
 If you have Windows Home, or prefer a lighter-weight option, use the WSL2 installer:
 ```powershell
-.\setup\QuarmInstaller.ps1
+.\setup\WSL\QuarmInstaller.ps1
 ```
 
 See `README.md` for more details.
