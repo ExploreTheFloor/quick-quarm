@@ -7,6 +7,37 @@ param(
     [switch]$Force
 )
 
+# Import shared module
+$modulePath = Join-Path $PSScriptRoot "HyperV-QuarmCommon.psm1"
+if (Test-Path $modulePath) {
+    Import-Module $modulePath -Force
+} else {
+    Write-Host "ERROR: Shared module not found at: $modulePath" -ForegroundColor Red
+    exit 1
+}
+
+# ============================================================================
+# LOGGING SETUP
+# ============================================================================
+
+# Create logs directory
+$LogDir = Join-Path $PSScriptRoot "logs"
+if (-not (Test-Path $LogDir)) {
+    New-Item -ItemType Directory -Path $LogDir -Force | Out-Null
+}
+
+# Start transcript with timestamp
+$Timestamp = Get-Date -Format "yyyyMMdd-HHmmss"
+$LogFile = Join-Path $LogDir "QuarmUninstaller-$Timestamp.log"
+Start-Transcript -Path $LogFile -Append
+
+Write-Host "Logging to: $LogFile" -ForegroundColor Gray
+Write-Host ""
+
+# ============================================================================
+
+try {
+
 $VMName = "QuickQuarm"
 $VMPath = "C:\Users\Laptop\QuickQuarm-VM"
 
@@ -28,15 +59,9 @@ function Add-UninstallResult {
     }
 }
 
-# Function to check if VM exists
+# Test-QuickQuarmVM now uses Test-VMExists from shared module
 function Test-QuickQuarmVM {
-    try {
-        $vm = Get-VM -Name $VMName -ErrorAction SilentlyContinue
-        return $null -ne $vm
-    }
-    catch {
-        return $false
-    }
+    return (Test-VMExists -VMName $VMName)
 }
 
 # Function to check if VM files exist
@@ -135,8 +160,9 @@ function Remove-QuickQuarmVMFiles {
     }
 }
 
-# Function to remove port forwarding
-function Remove-PortForwarding {
+# Remove-PortForwarding is now in the shared module
+# Wrapper function for uninstaller-specific logic
+function Remove-PortForwardingWrapper {
     param([bool]$ShouldRemove = $true)
     
     Write-Host "[STEP 3/4] Removing port forwarding..." -ForegroundColor Yellow
@@ -148,7 +174,7 @@ function Remove-PortForwarding {
     }
     
     try {
-        $portForwarding = netsh interface portproxy show all 2>&1 | Out-String
+        $portForwarding = Get-PortForwarding
         $hasForwarding = $portForwarding -match "2222|6000|5998|9000"
         
         if (-not $hasForwarding) {
@@ -157,20 +183,7 @@ function Remove-PortForwarding {
             return
         }
         
-        $removedCount = 0
-        $ports = @(2222, 6000, 5998, 9000)
-        
-        foreach ($port in $ports) {
-            try {
-                netsh interface portproxy delete v4tov4 listenport=$port listenaddress=0.0.0.0 2>&1 | Out-Null
-                if ($LASTEXITCODE -eq 0) {
-                    $removedCount++
-                }
-            }
-            catch {
-                # Continue
-            }
-        }
+        $removedCount = Remove-PortForwarding -Ports @(2222, 6000, 5998, 9000)
         
         Add-UninstallResult -ComponentName "Port Forwarding" -Status "Removed" -Message "Removed $removedCount port forwarding rule(s)"
         Write-Host "  [OK] Removed $removedCount port forwarding rule(s)" -ForegroundColor Green
@@ -181,8 +194,9 @@ function Remove-PortForwarding {
     }
 }
 
-# Function to remove firewall rules
-function Remove-FirewallRules {
+# Remove-FirewallRules is now in the shared module
+# Wrapper function for uninstaller-specific logic
+function Remove-FirewallRulesWrapper {
     param([bool]$ShouldRemove = $true)
     
     Write-Host "[STEP 4/4] Removing firewall rules..." -ForegroundColor Yellow
@@ -204,26 +218,14 @@ function Remove-FirewallRules {
             return
         }
         
-        $removedCount = 0
-        $failedRules = @()
+        $removedCount = Remove-FirewallRules
         
-        foreach ($rule in $firewallRules) {
-            try {
-                Remove-NetFirewallRule -DisplayName $rule.DisplayName -ErrorAction Stop
-                $removedCount++
-            }
-            catch {
-                $failedRules += $rule.DisplayName
-            }
-        }
-        
-        if ($failedRules.Count -gt 0) {
-            Add-UninstallResult -ComponentName "Firewall Rules" -Status "Failed" -Message "Removed $removedCount/$($firewallRules.Count) rules. Failed: $($failedRules -join ', ')"
-            Write-Host "  ! Removed $removedCount/$($firewallRules.Count) rules" -ForegroundColor Yellow
-        }
-        else {
+        if ($removedCount -gt 0) {
             Add-UninstallResult -ComponentName "Firewall Rules" -Status "Removed" -Message "Successfully removed $removedCount rule(s)"
             Write-Host "  [OK] Successfully removed $removedCount rule(s)" -ForegroundColor Green
+        } else {
+            Add-UninstallResult -ComponentName "Firewall Rules" -Status "Failed" -Message "Failed to remove firewall rules"
+            Write-Host "  ! Failed to remove firewall rules" -ForegroundColor Yellow
         }
     }
     catch {
@@ -402,23 +404,9 @@ function Get-UninstallOptions {
         }
     }
     
-    # Confirm removal
+    # Warning message (confirmation already done in Server.bat)
     Write-Host "This will remove all Quick Quarm Hyper-V VM components." -ForegroundColor Yellow
     Write-Host ""
-    
-    if (-not $Force) {
-        $confirm = Read-Host "Do you want to proceed with uninstallation? (yes/no)"
-        if ($confirm -ne "yes") {
-            Write-Host ""
-            Write-Host "Uninstallation cancelled." -ForegroundColor Yellow
-            return $null
-        }
-        Write-Host ""
-    }
-    else {
-        Write-Host "Force mode enabled - skipping confirmation." -ForegroundColor Yellow
-        Write-Host ""
-    }
     
     return @{
         RemoveVM = $vmFound
@@ -431,8 +419,7 @@ function Get-UninstallOptions {
 # Main uninstallation process
 try {
     # Check if running as administrator
-    $currentPrincipal = New-Object Security.Principal.WindowsPrincipal([Security.Principal.WindowsIdentity]::GetCurrent())
-    if (-not $currentPrincipal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
+    if (-not (Test-Administrator)) {
         Write-Host "ERROR: This script must be run as Administrator" -ForegroundColor Red
         Write-Host "Right-click PowerShell and select Run as Administrator" -ForegroundColor Yellow
         exit 1
@@ -452,8 +439,8 @@ try {
     # Run uninstallation steps
     Remove-QuickQuarmVM -ShouldRemove $uninstallOptions.RemoveVM
     Remove-QuickQuarmVMFiles -ShouldRemove $uninstallOptions.RemoveFiles
-    Remove-PortForwarding -ShouldRemove $uninstallOptions.RemovePortForwarding
-    Remove-FirewallRules -ShouldRemove $uninstallOptions.RemoveFirewall
+    Remove-PortForwardingWrapper -ShouldRemove $uninstallOptions.RemovePortForwarding
+    Remove-FirewallRulesWrapper -ShouldRemove $uninstallOptions.RemoveFirewall
     
     # Generate and display report
     $exitCode = Get-UninstallReport
@@ -468,5 +455,7 @@ catch {
     exit 1
 }
 
-
-
+} finally {
+    # Stop transcript logging
+    Stop-Transcript
+}

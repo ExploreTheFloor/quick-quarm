@@ -72,7 +72,7 @@ echo ========================================
 echo Starting Quick Quarm Hyper-V VM
 echo ========================================
 echo.
-powershell -NoProfile -ExecutionPolicy Bypass -File "%~dp0Manage-QuarmVM.ps1" -Action Start
+powershell -NoProfile -ExecutionPolicy Bypass -File "%~dp0QuarmFixer-HyperV.ps1" -Action Start
 echo.
 pause
 goto MENU
@@ -83,7 +83,7 @@ echo ========================================
 echo Stopping Quick Quarm Hyper-V VM
 echo ========================================
 echo.
-powershell -NoProfile -ExecutionPolicy Bypass -File "%~dp0Manage-QuarmVM.ps1" -Action Stop
+powershell -NoProfile -ExecutionPolicy Bypass -File "%~dp0QuarmFixer-HyperV.ps1" -Action Stop
 echo.
 pause
 goto MENU
@@ -94,7 +94,7 @@ echo ========================================
 echo Restarting Quick Quarm Hyper-V VM
 echo ========================================
 echo.
-powershell -NoProfile -ExecutionPolicy Bypass -File "%~dp0Manage-QuarmVM.ps1" -Action Restart
+powershell -NoProfile -ExecutionPolicy Bypass -File "%~dp0QuarmFixer-HyperV.ps1" -Action Restart
 echo.
 pause
 goto MENU
@@ -105,7 +105,7 @@ echo ========================================
 echo Quick Quarm Hyper-V VM / Server Status
 echo ========================================
 echo.
-powershell -NoProfile -ExecutionPolicy Bypass -File "%~dp0Manage-QuarmVM.ps1" -Action Status
+powershell -NoProfile -ExecutionPolicy Bypass -File "%~dp0QuarmFixer-HyperV.ps1" -Action Status
 echo.
 pause
 goto MENU
@@ -116,7 +116,7 @@ echo ========================================
 echo Connect to VM (SSH)
 echo ========================================
 echo.
-powershell -NoProfile -ExecutionPolicy Bypass -File "%~dp0Manage-QuarmVM.ps1" -Action SSH
+powershell -NoProfile -ExecutionPolicy Bypass -File "%~dp0QuarmFixer-HyperV.ps1" -Action SSH
 echo.
 pause
 goto MENU
@@ -127,7 +127,7 @@ echo ========================================
 echo Quick Quarm Server Logs
 echo ========================================
 echo.
-powershell -NoProfile -ExecutionPolicy Bypass -File "%~dp0Manage-QuarmVM.ps1" -Action Logs
+powershell -NoProfile -ExecutionPolicy Bypass -File "%~dp0QuarmFixer-HyperV.ps1" -Action Logs
 echo.
 pause
 goto MENU
@@ -138,7 +138,7 @@ echo ========================================
 echo Connection Diagnostics (Hyper-V)
 echo ========================================
 echo.
-powershell -NoProfile -ExecutionPolicy Bypass -File "%~dp0Connection-HyperV.ps1" -Action Diagnose
+powershell -NoProfile -ExecutionPolicy Bypass -File "%~dp0QuarmFixer-HyperV.ps1" -Action Diagnose
 echo.
 pause
 goto MENU
@@ -153,10 +153,10 @@ echo NOTE: This requires Administrator privileges.
 echo.
 net session >nul 2>&1
 if %errorlevel% equ 0 (
-  powershell -NoProfile -ExecutionPolicy Bypass -File "%~dp0Connection-HyperV.ps1" -Action Fix
+  powershell -NoProfile -ExecutionPolicy Bypass -File "%~dp0QuarmFixer-HyperV.ps1" -Action FixConnection
 ) else (
   REM Run in an elevated PowerShell window and keep it open so output is visible.
-  powershell -NoProfile -Command "Start-Process powershell -Verb RunAs -Wait -ArgumentList @('-NoExit','-ExecutionPolicy','Bypass','-File','%~dp0Connection-HyperV.ps1','-Action','Fix')"
+  powershell -NoProfile -Command "Start-Process powershell -Verb RunAs -Wait -ArgumentList @('-NoExit','-ExecutionPolicy','Bypass','-File','%~dp0QuarmFixer-HyperV.ps1','-Action','FixConnection')"
 )
 echo.
 pause
@@ -172,10 +172,10 @@ echo NOTE: This requires Administrator privileges.
 echo.
 net session >nul 2>&1
 if %errorlevel% equ 0 (
-  powershell -NoProfile -ExecutionPolicy Bypass -File "%~dp0Connection-HyperV.ps1" -Action Undo
+  powershell -NoProfile -ExecutionPolicy Bypass -File "%~dp0QuarmFixer-HyperV.ps1" -Action UndoConnection
 ) else (
   REM Run in an elevated PowerShell window and keep it open so output is visible.
-  powershell -NoProfile -Command "Start-Process powershell -Verb RunAs -Wait -ArgumentList @('-NoExit','-ExecutionPolicy','Bypass','-File','%~dp0Connection-HyperV.ps1','-Action','Undo')"
+  powershell -NoProfile -Command "Start-Process powershell -Verb RunAs -Wait -ArgumentList @('-NoExit','-ExecutionPolicy','Bypass','-File','%~dp0QuarmFixer-HyperV.ps1','-Action','UndoConnection')"
 )
 echo.
 pause

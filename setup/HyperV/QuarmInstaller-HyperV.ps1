@@ -1,5 +1,10 @@
 # Quick Quarm Installation Script for Windows (Hyper-V VM)
 # This script creates a Hyper-V VM with Ubuntu 22.04 and installs Quick Quarm
+#
+# Ubuntu 22.04 Jammy Cloud-Init Bug Workaround:
+# Bug #1961832: ds-identify runs before SATA CDROM is detected, causing cloud-init to not run
+# Solution: Use 'ubuntu' as default user (guaranteed to work with cloud-init), configure datasource
+#           via bootcmd, and set up root access via runcmd. This works around the timing issue.
 
 #Requires -RunAsAdministrator
 
@@ -8,19 +13,84 @@ param(
     [string]$VMMemory = 4GB,
     [int]$VMProcessors = 2,
     [string]$VMDiskSize = 60GB,
-    [string]$InstallUser = "root",
-    [string]$InstallPassword = "root",
+    [string]$InstallUser = "ubuntu",
+    [string]$InstallPassword = "ubuntu",
     [string]$RepoUrl = "https://github.com/SecretsOTheP/EQMacEmu.git",
     [string]$DBHost = "localhost",
     [string]$DBName = "quarm",
     [string]$DBUser = "quarm",
-    [string]$DBPassword = "quarm"
+    [string]$DBPassword = "quarm",
+    [string]$StaticIP = "",
+    [string]$Gateway = "",
+    [string]$Netmask = "",
+    [string]$DNS = "8.8.8.8,8.8.4.4"
 )
+
+# ============================================================================
+# LOGGING SETUP
+# ============================================================================
+
+# Create logs directory
+$LogDir = Join-Path $PSScriptRoot "logs"
+if (-not (Test-Path $LogDir)) {
+    New-Item -ItemType Directory -Path $LogDir -Force | Out-Null
+}
+
+# Start transcript with timestamp
+$Timestamp = Get-Date -Format "yyyyMMdd-HHmmss"
+$LogFile = Join-Path $LogDir "QuarmInstaller-$Timestamp.log"
+Start-Transcript -Path $LogFile -Append
+
+Write-Host "Logging to: $LogFile" -ForegroundColor Gray
+Write-Host ""
+
+# ============================================================================
+
+try {
+
+# Disable QuickEdit mode to prevent script from pausing when console is clicked
+$quickEditCode = @'
+using System;
+using System.Runtime.InteropServices;
+public class QuickEditMode {
+    const uint ENABLE_QUICK_EDIT = 0x0040;
+    const int STD_INPUT_HANDLE = -10;
+    [DllImport("kernel32.dll", SetLastError = true)]
+    static extern IntPtr GetStdHandle(int nStdHandle);
+    [DllImport("kernel32.dll")]
+    static extern bool GetConsoleMode(IntPtr hConsoleHandle, out uint lpMode);
+    [DllImport("kernel32.dll")]
+    static extern bool SetConsoleMode(IntPtr hConsoleHandle, uint dwMode);
+    public static void Disable() {
+        IntPtr consoleHandle = GetStdHandle(STD_INPUT_HANDLE);
+        uint consoleMode;
+        if (GetConsoleMode(consoleHandle, out consoleMode)) {
+            consoleMode &= ~ENABLE_QUICK_EDIT;
+            SetConsoleMode(consoleHandle, consoleMode);
+        }
+    }
+}
+'@
+try {
+    Add-Type -TypeDefinition $quickEditCode -ErrorAction SilentlyContinue
+    [QuickEditMode]::Disable()
+} catch {
+    # QuickEdit disable failed, continue anyway
+}
 
 Write-Host "========================================" -ForegroundColor Cyan
 Write-Host "Quick Quarm VM Installation for Windows" -ForegroundColor Cyan
 Write-Host "========================================" -ForegroundColor Cyan
 Write-Host ""
+
+# Import shared module
+$modulePath = Join-Path $PSScriptRoot "HyperV-QuarmCommon.psm1"
+if (Test-Path $modulePath) {
+    Import-Module $modulePath -Force
+} else {
+    Write-Host "ERROR: Shared module not found at: $modulePath" -ForegroundColor Red
+    exit 1
+}
 
 # Function to check if Hyper-V is enabled
 function Test-HyperV {
@@ -250,13 +320,22 @@ function Convert-ImageToVHDX {
     }
 }
 
+# Get-DefaultSwitchNetworkConfig is now in the shared module
+
+# Note: Removed Add-NoCloudKernelParameter function as Windows cannot read Linux ext4 filesystems
+# The workaround is now applied via cloud-init bootcmd (see user-data configuration)
+
 # Function to create cloud-init ISO
 function New-CloudInitISO {
     param(
         [string]$ISOPath,
         [string]$PublicKeyPath,
         [string]$Username,
-        [string]$Password
+        [string]$Password,
+        [string]$StaticIP = "",
+        [string]$Gateway = "",
+        [string]$Netmask = "",
+        [string]$DNS = "8.8.8.8,8.8.4.4"
     )
     
     Write-Host '[STEP 6/8] Creating cloud-init configuration...' -ForegroundColor Yellow
@@ -279,24 +358,33 @@ local-hostname: quickquarm
 "@
     
     # Create user-data file with SSH key injection
+    # Follows verified pattern from working Hyper-V cloud-init examples
     $userData = @'
 #cloud-config
+# Force NoCloud datasource to ensure cloud-init detects config on Hyper-V
+datasource_list: [ NoCloud, None ]
+datasource:
+  NoCloud:
+    fs_label: cidata
 # Automatically grow root partition to fill disk
 growpart:
   mode: auto
   devices: ['/']
   ignore_growroot_disabled: false
+# Configure ubuntu user with SSH key
 users:
-  - name: {USERNAME}
+  - name: ubuntu
     gecos: Quick Quarm User
     groups: [adm, audio, cdrom, dialout, dip, floppy, netdev, plugdev, sudo, video]
     shell: /bin/bash
     sudo: ['ALL=(ALL) NOPASSWD:ALL']
+    lock_passwd: false
     ssh_authorized_keys:
       - {PUBLICKEY}
+# Set password for ubuntu user
 chpasswd:
   list: |
-    {USERNAME}:{PASSWORD}
+    ubuntu:{PASSWORD}
   expire: false
 ssh_pwauth: true
 package_update: true
@@ -307,16 +395,37 @@ packages:
   - linux-tools-generic
   - linux-generic
 bootcmd:
+  - echo "===== CLOUD-INIT BOOTCMD STARTING =====" | tee -a /var/log/hyperv-install.log
+  - date | tee -a /var/log/hyperv-install.log
+  - echo "Loading Hyper-V kernel modules..." | tee -a /var/log/hyperv-install.log
   - modprobe hv_balloon
   - modprobe hv_utils
   - modprobe hv_vmbus
   - modprobe hv_sock
   - modprobe hv_storvsc
   - modprobe hv_netvsc
+  - echo "Hyper-V modules loaded" | tee -a /var/log/hyperv-install.log
+  - lsmod | grep hv_ | tee -a /var/log/hyperv-install.log
+  - echo "Persisting Hyper-V modules..." | tee -a /var/log/hyperv-install.log
   - sh -c 'echo "hv_balloon\nhv_utils\nhv_vmbus\nhv_sock\nhv_storvsc\nhv_netvsc" >>/etc/initramfs-tools/modules' && update-initramfs -k all -u
+  - echo "===== CLOUD-INIT BOOTCMD COMPLETED =====" | tee -a /var/log/hyperv-install.log
 runcmd:
+  - echo "===== CLOUD-INIT RUNCMD STARTING =====" | tee -a /var/log/hyperv-install.log
+  - date | tee -a /var/log/hyperv-install.log
+  - echo "Ensuring SSH service is enabled..." | tee -a /var/log/hyperv-install.log
   - systemctl enable ssh
-  - systemctl start ssh
+  - echo "Restarting SSH to apply cloud-init configuration..." | tee -a /var/log/hyperv-install.log
+  - systemctl restart ssh
+  - sleep 2
+  - systemctl status ssh --no-pager | tee -a /var/log/hyperv-install.log
+  - echo "Verifying SSH key injection..." | tee -a /var/log/hyperv-install.log
+  - ls -la /home/ubuntu/.ssh/ | tee -a /var/log/hyperv-install.log
+  - echo "SSH authorized_keys content:" | tee -a /var/log/hyperv-install.log
+  - cat /home/ubuntu/.ssh/authorized_keys | tee -a /var/log/hyperv-install.log
+  - echo "Network configuration:" | tee -a /var/log/hyperv-install.log
+  - ip addr show | tee -a /var/log/hyperv-install.log
+  - echo "===== CLOUD-INIT RUNCMD COMPLETED =====" | tee -a /var/log/hyperv-install.log
+  - date | tee -a /var/log/hyperv-install.log
 '@
     
     # Replace placeholders with actual values
@@ -324,13 +433,141 @@ runcmd:
     $userData = $userData -replace '\{PASSWORD\}', $Password
     $userData = $userData -replace '\{PUBLICKEY\}', $publicKey
     
-    $metaData | Out-File -FilePath (Join-Path $tempDir "meta-data") -Encoding ASCII -NoNewline
-    $userData | Out-File -FilePath (Join-Path $tempDir "user-data") -Encoding ASCII -NoNewline
+    # Write configuration files
+    $metaDataPath = Join-Path $tempDir "meta-data"
+    $userDataPath = Join-Path $tempDir "user-data"
     
-    # Create network-config file with DHCP for all interfaces
-    # This works with External switches (physical network DHCP)
-    # For Default Switch/Internal switches, DHCP may not work but VM will still boot
-    $networkConfig = @"
+    $metaData | Out-File -FilePath $metaDataPath -Encoding ASCII -NoNewline
+    $userData | Out-File -FilePath $userDataPath -Encoding ASCII -NoNewline
+    
+    # Debug: Log first few lines of user-data to verify NoCloud datasource config
+    Write-Host "    [DEBUG] Cloud-init user-data configuration:" -ForegroundColor DarkGray
+    $userDataLines = Get-Content $userDataPath | Select-Object -First 10
+    foreach ($line in $userDataLines) {
+        Write-Host "      $line" -ForegroundColor DarkGray
+    }
+    
+    # Create network-config file
+    # Use static IP if provided, otherwise use DHCP
+    if (-not [string]::IsNullOrEmpty($StaticIP) -and -not [string]::IsNullOrEmpty($Gateway) -and -not [string]::IsNullOrEmpty($Netmask)) {
+        # Convert netmask to prefix length if needed
+        $prefixLength = $Netmask
+        if ($Netmask -match '^\d+\.\d+\.\d+\.\d+$') {
+            # Convert dotted decimal to prefix length
+            $octets = $Netmask.Split('.')
+            $binary = ""
+            foreach ($octet in $octets) {
+                $binary += [Convert]::ToString([int]$octet, 2).PadLeft(8, '0')
+            }
+            $prefixLength = ($binary -replace '0+$', '').Length
+        }
+        
+        # Validate network configuration before proceeding
+        Write-Host "  - Validating network configuration..." -ForegroundColor Gray
+        
+        # Validate static IP and gateway are valid IPv4 addresses
+        try {
+            $staticIPObj = [System.Net.IPAddress]::Parse($StaticIP)
+            $gatewayObj = [System.Net.IPAddress]::Parse($Gateway)
+        }
+        catch {
+            Write-Host "  ! ERROR: Invalid IP address format" -ForegroundColor Red
+            Write-Host "    Static IP: $StaticIP" -ForegroundColor Red
+            Write-Host "    Gateway: $Gateway" -ForegroundColor Red
+            throw "Invalid network configuration"
+        }
+        
+        # Validate static IP and gateway are in same subnet
+        $staticIPBytes = $staticIPObj.GetAddressBytes()
+        $gatewayBytes = $gatewayObj.GetAddressBytes()
+        
+        # Calculate subnet mask as integer
+        $maskInt = [Convert]::ToUInt32(("1" * $prefixLength).PadRight(32, "0"), 2)
+        
+        # Calculate network addresses (bitwise AND with mask)
+        $staticNetwork = [System.BitConverter]::ToUInt32($staticIPBytes[3..0], 0) -band $maskInt
+        $gatewayNetwork = [System.BitConverter]::ToUInt32($gatewayBytes[3..0], 0) -band $maskInt
+        
+        if ($staticNetwork -ne $gatewayNetwork) {
+            Write-Host "  ! ERROR: Static IP and Gateway are not in same subnet" -ForegroundColor Red
+            Write-Host "    Static IP: $StaticIP/$prefixLength" -ForegroundColor Red
+            Write-Host "    Gateway: $Gateway" -ForegroundColor Red
+            throw "Static IP and Gateway must be in same subnet"
+        }
+        
+        # Check static IP is not network address, broadcast, or gateway
+        $staticIPInt = [System.BitConverter]::ToUInt32($staticIPBytes[3..0], 0)
+        $gatewayIPInt = [System.BitConverter]::ToUInt32($gatewayBytes[3..0], 0)
+        $broadcastInt = $staticNetwork -bor (-bnot $maskInt -band 0xFFFFFFFF)
+        
+        if ($staticIPInt -eq $staticNetwork) {
+            Write-Host "  ! ERROR: Static IP cannot be the network address" -ForegroundColor Red
+            throw "Invalid static IP (network address)"
+        }
+        if ($staticIPInt -eq $broadcastInt) {
+            Write-Host "  ! ERROR: Static IP cannot be the broadcast address" -ForegroundColor Red
+            throw "Invalid static IP (broadcast address)"
+        }
+        if ($staticIPInt -eq $gatewayIPInt) {
+            Write-Host "  ! ERROR: Static IP cannot be the same as gateway" -ForegroundColor Red
+            throw "Invalid static IP (same as gateway)"
+        }
+        
+        Write-Host "  + Network configuration validated" -ForegroundColor Green
+        
+        # Parse DNS servers
+        $dnsServers = $DNS -split ',' | ForEach-Object { $_.Trim() }
+        
+        # Validate DNS servers are valid IPv4 addresses
+        foreach ($dnsServer in $dnsServers) {
+            try {
+                $null = [System.Net.IPAddress]::Parse($dnsServer)
+                if ($dnsServer -eq "0.0.0.0" -or $dnsServer -eq "255.255.255.255") {
+                    Write-Host "  ! ERROR: Invalid DNS server: $dnsServer" -ForegroundColor Red
+                    throw "Invalid DNS server address"
+                }
+            }
+            catch {
+                Write-Host "  ! ERROR: Invalid DNS server format: $dnsServer" -ForegroundColor Red
+                throw "Invalid DNS server configuration"
+            }
+        }
+        
+        $dnsServersYaml = $dnsServers -join ', '
+        Write-Host "  + DNS servers validated: $($dnsServers -join ', ')" -ForegroundColor Green
+        
+        Write-Host "  - Configuring static IP: $StaticIP/$prefixLength" -ForegroundColor Gray
+        $networkConfig = @"
+version: 2
+ethernets:
+  id0:
+    match:
+      name: "eth*"
+    addresses:
+      - $StaticIP/$prefixLength
+    routes:
+      - to: default
+        via: $Gateway
+    nameservers:
+      addresses: [$dnsServersYaml]
+  id1:
+    match:
+      name: "en*"
+    addresses:
+      - $StaticIP/$prefixLength
+    routes:
+      - to: default
+        via: $Gateway
+    nameservers:
+      addresses: [$dnsServersYaml]
+"@
+    }
+    else {
+        # Use DHCP for all interfaces
+        # This works with External switches (physical network DHCP)
+        # For Default Switch/Internal switches, DHCP may not work but VM will still boot
+        Write-Host "  - Configuring DHCP (dynamic IP)" -ForegroundColor Gray
+        $networkConfig = @"
 version: 2
 ethernets:
   id0:
@@ -344,6 +581,7 @@ ethernets:
     dhcp4: true
     dhcp6: false
 "@
+    }
     
     $networkConfig | Out-File -FilePath (Join-Path $tempDir "network-config") -Encoding ASCII -NoNewline
     
@@ -374,8 +612,23 @@ ethernets:
         Write-Host "  + Windows ADK Deployment Tools installed" -ForegroundColor Green
     }
     
-    # Create ISO using oscdimg
-    & $oscdimgPath -n -m -d -l"CIDATA" $tempDir $ISOPath 2>&1 | Out-Null
+    # Create ISO using oscdimg with Joliet format (required for Hyper-V cloud-init detection)
+    # -j1 creates both Joliet AND ISO 9660 file systems (required for Hyper-V NoCloud datasource)
+    # -lcidata sets volume label to CIDATA (required by cloud-init NoCloud)
+    # -r resolves symbolic links
+    Write-Host "    [DEBUG] Creating ISO with NoCloud datasource..." -ForegroundColor DarkGray
+    Write-Host "      Source: $tempDir" -ForegroundColor DarkGray
+    Write-Host "      Target: $ISOPath" -ForegroundColor DarkGray
+    Write-Host "      Volume label: CIDATA (required for NoCloud)" -ForegroundColor DarkGray
+    
+    $oscdimgOutput = & $oscdimgPath $tempDir $ISOPath -j1 -lcidata -r 2>&1
+    
+    if ($LASTEXITCODE -ne 0) {
+        Write-Host "  ! WARNING: oscdimg returned exit code $LASTEXITCODE" -ForegroundColor Yellow
+        Write-Host "    Output: $oscdimgOutput" -ForegroundColor Gray
+    } else {
+        Write-Host "    [DEBUG] ISO created successfully with CIDATA label" -ForegroundColor DarkGray
+    }
     
     # Cleanup temp directory
     Remove-Item -Path $tempDir -Recurse -Force
@@ -494,106 +747,31 @@ function New-QuickQuarmVM {
     # Connect VM to switch
     Connect-VMNetworkAdapter -VMName $Name -SwitchName $switch.Name
     
-    # Disable Secure Boot for Ubuntu compatibility
-    Set-VMFirmware -VMName $Name -EnableSecureBoot Off
+    # Configure Secure Boot for Ubuntu compatibility (Gen2 VM requires UEFI cert authority)
+    Set-VMFirmware -VMName $Name -EnableSecureBoot On -SecureBootTemplate 'MicrosoftUEFICertificateAuthority'
+    
+    # Configure VM to start automatically on host boot/resume
+    Write-Host "  - Configuring VM auto-start..." -ForegroundColor Gray
+    Set-VM -VMName $Name -AutomaticStartAction Start -AutomaticStartDelay 0
+    Set-VM -VMName $Name -AutomaticStopAction Save
+    Write-Host "  + VM auto-start configured" -ForegroundColor Green
     
     Write-Host "  + VM created successfully" -ForegroundColor Green
     
     return $vm
 }
 
-# Function to detect VM IP by scanning Default Switch subnet
-function Get-VMIPAddress {
-    param(
-        [string]$VMName,
-        [int]$TimeoutSeconds = 180
-    )
-    
-    Write-Host "  - Detecting VM IP address..." -ForegroundColor Gray
-    
-    # Get Default Switch subnet
-    $defaultSwitchIP = Get-NetIPAddress -InterfaceAlias "vEthernet (Default Switch)" -AddressFamily IPv4 -ErrorAction SilentlyContinue
-    if (-not $defaultSwitchIP) {
-        Write-Host "  ! Could not detect Default Switch IP" -ForegroundColor Yellow
-        return $null
-    }
-    
-    $hostIP = $defaultSwitchIP.IPAddress
-    $prefixLength = $defaultSwitchIP.PrefixLength
-    
-    # Calculate subnet range based on prefix length
-    $ipBytes = [System.Net.IPAddress]::Parse($hostIP).GetAddressBytes()
-    $ipInt = [System.BitConverter]::ToUInt32($ipBytes[3..0], 0)
-    
-    $maskInt = [Convert]::ToUInt32(("1" * $prefixLength).PadRight(32, "0"), 2)
-    $networkInt = $ipInt -band $maskInt
-    $broadcastInt = $networkInt -bor (-bnot $maskInt)
-    
-    Write-Host "  - Scanning /$prefixLength subnet for VM (this may take a moment)..." -ForegroundColor Gray
-    
-    $elapsed = 0
-    $scanInterval = 15
-    
-    while ($elapsed -lt $TimeoutSeconds) {
-        # Scan IP range from network+2 to broadcast-1 (skip network and broadcast addresses)
-        for ($ipToTest = $networkInt + 2; $ipToTest -lt $broadcastInt; $ipToTest++) {
-            # Convert back to IP address
-            $bytes = [System.BitConverter]::GetBytes($ipToTest)
-            $testIP = [System.Net.IPAddress]::new($bytes[3..0]).ToString()
-            
-            # Skip the host IP itself
-            if ($testIP -eq $hostIP) { continue }
-            
-            # Quick TCP connect test to port 22
-            try {
-                $tcpClient = New-Object System.Net.Sockets.TcpClient
-                $connect = $tcpClient.BeginConnect($testIP, 22, $null, $null)
-                $wait = $connect.AsyncWaitHandle.WaitOne(50, $false)
-                
-                if ($wait) {
-                    try {
-                        $tcpClient.EndConnect($connect)
-                        $tcpClient.Close()
-                        Write-Host "  + Found VM at IP: $testIP" -ForegroundColor Green
-                        return $testIP
-                    }
-                    catch {
-                        $tcpClient.Close()
-                    }
-                }
-                else {
-                    $tcpClient.Close()
-                }
-            }
-            catch {
-                # Ignore connection errors
-            }
-            
-            # Show progress every 256 IPs
-            if ($ipToTest % 256 -eq 0) {
-                $progress = [Math]::Round((($ipToTest - $networkInt) / ($broadcastInt - $networkInt)) * 100)
-                Write-Host "  - Scanning... $progress% complete" -ForegroundColor Gray
-            }
-        }
-        
-        Start-Sleep -Seconds $scanInterval
-        $elapsed += $scanInterval
-        Write-Host "  - Rescanning subnet... ($elapsed/$TimeoutSeconds seconds)" -ForegroundColor Gray
-    }
-    
-    Write-Host "  ! Could not detect VM IP address" -ForegroundColor Red
-    return $null
-}
+# Get-VMIPAddress is now in the shared module
 
-# Function to set up port forwarding for SSH access
-function Set-VMPortForward {
+# Helper function for SSH port forwarding (2222->22) - different from game ports
+function Set-SSHPortForward {
     param(
         [string]$VMIPAddress,
         [int]$HostPort = 2222,
         [int]$VMPort = 22
     )
     
-    Write-Host "  - Setting up port forwarding (localhost:${HostPort} -> ${VMIPAddress}:${VMPort})..." -ForegroundColor Gray
+    Write-Host "  - Setting up SSH port forwarding (localhost:${HostPort} -> ${VMIPAddress}:${VMPort})..." -ForegroundColor Gray
     
     # Remove any existing port forward
     $existing = netsh interface portproxy show v4tov4 | Select-String "0.0.0.0\s+$HostPort"
@@ -605,11 +783,11 @@ function Set-VMPortForward {
     $result = netsh interface portproxy add v4tov4 listenaddress=0.0.0.0 listenport=$HostPort connectaddress=$VMIPAddress connectport=$VMPort
     
     if ($LASTEXITCODE -eq 0) {
-        Write-Host "  + Port forwarding configured" -ForegroundColor Green
+        Write-Host "  + SSH port forwarding configured" -ForegroundColor Green
         return $true
     }
     else {
-        Write-Host "  ! Failed to configure port forwarding" -ForegroundColor Red
+        Write-Host "  ! Failed to configure SSH port forwarding" -ForegroundColor Red
         return $false
     }
 }
@@ -619,46 +797,124 @@ function Start-VMAndWaitForSSH {
     param(
         [string]$VMName,
         [int]$TimeoutSeconds = 300,
-        [int]$SSHPort = 22
+        [int]$SSHPort = 22,
+        [string]$StaticIP = "",
+        [string]$SSHKeyPath,
+        [string]$Username
     )
     
     Write-Host "  - Starting VM..." -ForegroundColor Gray
+    Write-Host "    [DEBUG] VM Name: $VMName" -ForegroundColor DarkGray
+    Write-Host "    [DEBUG] Static IP: $StaticIP" -ForegroundColor DarkGray
+    Write-Host "    [DEBUG] Current time: $(Get-Date -Format 'HH:mm:ss')" -ForegroundColor DarkGray
     Start-VM -Name $VMName
+    Write-Host "  + VM started at $(Get-Date -Format 'HH:mm:ss')" -ForegroundColor Green
     
-    Write-Host "  - Waiting for VM to boot (2 minutes)..." -ForegroundColor Gray
-    Start-Sleep -Seconds 120
+    Write-Host "  - Waiting for VM to boot and cloud-init to complete (5 minutes)..." -ForegroundColor Gray
+    Write-Host "    Cloud-init with package updates can take 3-7 minutes on first boot" -ForegroundColor Gray
+    Write-Host "    This ensures SSH keys and user accounts are fully configured" -ForegroundColor Gray
+    Start-Sleep -Seconds 300
     
-    # Detect VM IP address by scanning
-    $vmIP = Get-VMIPAddress -VMName $VMName -TimeoutSeconds 120
+    # Remove cloud-init DVD drive after cloud-init has run
+    Write-Host "  - Removing cloud-init DVD drive..." -ForegroundColor Gray
+    try {
+        $dvdDrives = Get-VMDvdDrive -VMName $VMName
+        $cloudInitDrive = $dvdDrives | Where-Object { $_.Path -like "*cloud-init*" }
+        if ($cloudInitDrive) {
+            $cloudInitDrive | Remove-VMDvdDrive -ErrorAction SilentlyContinue
+            Write-Host "  + Cloud-init DVD drive removed" -ForegroundColor Green
+        }
+    }
+    catch {
+        Write-Host "  ! Could not remove DVD drive (non-critical)" -ForegroundColor Yellow
+    }
+    
+    # Detect VM IP address (use static IP if provided, otherwise scan)
+    $vmIP = Get-VMIPAddress -VMName $VMName -TimeoutSeconds 120 -StaticIP $StaticIP
     
     if (-not $vmIP) {
         Write-Host "  ! Could not detect VM IP address" -ForegroundColor Red
         return $null
     }
     
+    Write-Host "  + VM IP detected: $vmIP" -ForegroundColor Green
+    
+    # Verify cloud-init completed via direct SSH connection
+    Write-Host "  - Verifying cloud-init completed via SSH..." -ForegroundColor Gray
+    $cloudInitVerified = $false
+    $maxAttempts = 10  # 10 attempts * 5 seconds = 50 seconds max
+    $attempt = 0
+    
+    while ($attempt -lt $maxAttempts -and -not $cloudInitVerified) {
+        $attempt++
+        
+        # Try SSH connection to verify cloud-init
+        $sshTest = & ssh -i $SSHKeyPath -o ConnectTimeout=5 -o StrictHostKeyChecking=no -o UserKnownHostsFile=NUL "${Username}@${vmIP}" "cloud-init status 2>&1" 2>&1
+        
+        if ($LASTEXITCODE -eq 0 -and $sshTest -match "status: done") {
+            Write-Host "  + Cloud-init completed successfully" -ForegroundColor Green
+            $cloudInitVerified = $true
+        }
+        elseif ($attempt -lt $maxAttempts) {
+            if ($attempt % 3 -eq 0) {
+                Write-Host "    Waiting for cloud-init... (attempt $attempt/$maxAttempts)" -ForegroundColor Gray
+            }
+            Start-Sleep -Seconds 5
+        }
+    }
+    
+    if (-not $cloudInitVerified) {
+        Write-Host "  ! Cloud-init status could not be verified via SSH" -ForegroundColor Yellow
+        Write-Host "    Continuing anyway - SSH connection will be tested next" -ForegroundColor Gray
+    }
+    
     # Set up port forwarding for SSH access
-    $portForward = Set-VMPortForward -VMIPAddress $vmIP -HostPort 2222 -VMPort 22
+    $portForward = Set-SSHPortForward -VMIPAddress $vmIP -HostPort 2222 -VMPort 22
     
     if (-not $portForward) {
         Write-Host "  ! Could not set up port forwarding" -ForegroundColor Red
-        return $null
+        Write-Host "    Will try direct IP connection as fallback" -ForegroundColor Yellow
     }
     
-    # Test SSH connection via port forward
-    Write-Host "  - Testing SSH connection via localhost:2222..." -ForegroundColor Gray
-    Start-Sleep -Seconds 5
+    # Test SSH connection - try port forward first, then direct IP
+    Write-Host "  - Testing SSH connection..." -ForegroundColor Gray
+    Start-Sleep -Seconds 3
     
-    $sshTest = Test-NetConnection -ComputerName "localhost" -Port 2222 -InformationLevel Quiet -WarningAction SilentlyContinue
+    $sshWorking = $false
+    $connectionString = ""
     
-    if ($sshTest) {
-        Write-Host "  + SSH is available via port forward" -ForegroundColor Green
+    # Try port forward first
+    if ($portForward) {
+        $portTest = Test-NetConnection -ComputerName "localhost" -Port 2222 -InformationLevel Quiet -WarningAction SilentlyContinue -ErrorAction SilentlyContinue
+        if ($portTest) {
+            $sshKeyTest = & ssh -i $SSHKeyPath -p 2222 -o ConnectTimeout=5 -o StrictHostKeyChecking=no -o UserKnownHostsFile=NUL "${Username}@localhost" "echo 'SSH OK'" 2>&1
+            if ($LASTEXITCODE -eq 0 -and $sshKeyTest -match "SSH OK") {
+                Write-Host "  + SSH via port forward (localhost:2222) working" -ForegroundColor Green
+                $sshWorking = $true
+                $connectionString = "localhost:2222"
+            }
+        }
+    }
+    
+    # Fallback to direct IP if port forward failed
+    if (-not $sshWorking) {
+        Write-Host "    Port forward not working, trying direct IP connection..." -ForegroundColor Gray
+        $sshKeyTest = & ssh -i $SSHKeyPath -o ConnectTimeout=5 -o StrictHostKeyChecking=no -o UserKnownHostsFile=NUL "${Username}@${vmIP}" "echo 'SSH OK'" 2>&1
+        if ($LASTEXITCODE -eq 0 -and $sshKeyTest -match "SSH OK") {
+            Write-Host "  + SSH via direct IP ($vmIP) working" -ForegroundColor Green
+            $sshWorking = $true
+            $connectionString = $vmIP
+        }
+    }
+    
+    if ($sshWorking) {
         return @{
-            ConnectionString = "localhost:2222"
+            ConnectionString = $connectionString
             ActualIP = $vmIP
         }
     }
     else {
-        Write-Host "  ! SSH not responding via port forward" -ForegroundColor Red
+        Write-Host "  ! SSH connection failed (both port forward and direct IP)" -ForegroundColor Red
         return $null
     }
 }
@@ -669,6 +925,7 @@ function Install-QuickQuarmViaSSH {
         [string]$VMIPAddress,  # Can be "IP" or "localhost:port"
         [string]$ActualVMIP,   # The real VM IP for configuration
         [string]$Username,
+        [string]$Password,
         [string]$PrivateKeyPath,
         [string]$RepoUrl,
         [string]$DBHost,
@@ -682,27 +939,54 @@ function Install-QuickQuarmViaSSH {
     Write-Host ""
     
     # Parse connection string (localhost:2222 or IP)
-    $sshHost = $VMIPAddress
-    $sshPort = 22
+    $sshHost = "localhost"
+    $sshPort = 2222
     if ($VMIPAddress -match '^(.+):(\d+)$') {
         $sshHost = $matches[1]
-        $sshPort = $matches[2]
+        $sshPort = [int]$matches[2]
+    } elseif ($VMIPAddress -notmatch ':') {
+        # Plain IP without port - must be direct connection
+        $sshHost = $VMIPAddress
+        $sshPort = 22
     }
+    
+    Write-Host "  [DEBUG] SSH connection: ${sshHost}:${sshPort}" -ForegroundColor DarkGray
     
     # Create installation script
     $installScript = @'
 #!/bin/bash
 set -e
 
-echo '[1/6] Updating system...'
+echo '[1/7] Waiting for cloud-init to complete...'
+echo '  (This ensures system initialization is finished)'
+# Wait for cloud-init to finish
+sudo cloud-init status --wait || true
+echo '  + Cloud-init completed'
+
+# Verify SSH key was injected properly
+if [ ! -f /home/ubuntu/.ssh/authorized_keys ]; then
+    echo '  ! ERROR: SSH authorized_keys file not found'
+    echo '  Expected: /home/ubuntu/.ssh/authorized_keys'
+    echo '  Cloud-init may not have run properly'
+    exit 1
+fi
+
+if ! grep -q "quickquarm@hyperv" /home/ubuntu/.ssh/authorized_keys 2>/dev/null; then
+    echo '  ! ERROR: SSH key not found in authorized_keys'
+    echo '  Cloud-init did not inject the SSH key properly'
+    exit 1
+fi
+echo '  + SSH key properly configured'
+
+echo '[2/7] Updating system...'
 export DEBIAN_FRONTEND=noninteractive
 sudo apt-get update -qq
 sudo apt-get upgrade -y -qq
 
-echo '[2/6] Installing git...'
+echo '[3/7] Installing git...'
 sudo apt-get install -y -qq git
 
-echo '[3/6] Cloning Quick Quarm repository...'
+echo '[4/7] Cloning Quick Quarm repository...'
 cd ~
 if [ -d quick-quarm ]; then
     cd quick-quarm && git pull -q
@@ -711,7 +995,7 @@ else
     cd quick-quarm
 fi
 
-echo '[4/6] Creating configuration file...'
+echo '[5/7] Creating configuration file...'
 cat > /tmp/qq_answers.txt << 'ANSWERS_EOF'
 {USERNAME}
 {REPOURL}
@@ -723,13 +1007,157 @@ cat > /tmp/qq_answers.txt << 'ANSWERS_EOF'
 N
 ANSWERS_EOF
 
-echo '[5/6] Running Quick Quarm setup...'
+echo '[6/7] Running Quick Quarm setup...'
 echo '  (This is the longest step - 15-20 minutes)'
 sudo bash -c 'cat /tmp/qq_answers.txt | ./scripts/setup'
 rm -f /tmp/qq_answers.txt
 
-echo '[6/6] Starting Quick Quarm services...'
-sudo systemctl start quick-quarm.target
+echo '[7/7] Verifying and starting Quick Quarm services...'
+
+# Check if services are already running (install-systemd may have started them)
+if systemctl is-active --quiet quick-quarm.target; then
+    echo '  + Services are already running (started by install-systemd)'
+else
+    echo '  - Services are not running, checking prerequisites...'
+    
+    # Check if services are enabled
+    if systemctl is-enabled --quiet quick-quarm.target 2>/dev/null; then
+        echo '  + Services are enabled for auto-start'
+    else
+        echo '  - Enabling services for auto-start...'
+        if ! sudo systemctl enable quick-quarm.target; then
+            echo '  ! ERROR: Failed to enable services'
+            exit 1
+        fi
+    fi
+    
+    # Verify prerequisites before starting
+    echo '  - Verifying prerequisites...'
+    
+    # Check if database is running
+    if ! systemctl is-active --quiet mariadb.service; then
+        echo '  ! ERROR: MariaDB/MySQL is not running'
+        echo '  Attempting to start database...'
+        if ! sudo systemctl start mariadb.service; then
+            echo '  ! ERROR: Failed to start database'
+            exit 1
+        fi
+        sleep 3
+        if ! systemctl is-active --quiet mariadb.service; then
+            echo '  ! ERROR: Database did not start'
+            exit 1
+        fi
+    fi
+    echo '    + Database service is running'
+    
+    # Wait for database to be truly ready (not just active)
+    echo '  - Waiting for database to accept connections...'
+    DB_READY=0
+    for i in {1..30}; do
+        if mysqladmin -u {DBUSER} -p{DBPASSWORD} ping >/dev/null 2>&1; then
+            DB_READY=1
+            echo '    + Database is ready and accepting connections'
+            break
+        fi
+        sleep 1
+    done
+    
+    if [ $DB_READY -eq 0 ]; then
+        echo '  ! WARNING: Database not responding to connections after 30 seconds'
+        echo '  Attempting to continue anyway...'
+    fi
+    
+    # Check if binaries exist
+    QQDIR="$HOME/quick-quarm"
+    if [ ! -f "$QQDIR/bin/world" ] || [ ! -f "$QQDIR/bin/loginserver" ]; then
+        echo '  ! ERROR: Server binaries not found'
+        echo "  Expected location: $QQDIR/bin/"
+        echo '  This indicates the build step may have failed'
+        exit 1
+    fi
+    echo '    + Binaries found'
+    
+    # Check if binaries are executable
+    if [ ! -x "$QQDIR/bin/world" ] || [ ! -x "$QQDIR/bin/loginserver" ]; then
+        echo '  - Making binaries executable...'
+        chmod +x "$QQDIR/bin"/*
+    fi
+    
+    # Reload systemd to ensure services are up to date
+    echo '  - Reloading systemd daemon...'
+    sudo systemctl daemon-reload
+    
+    # Start the services with proper error handling
+    echo '  - Starting Quick Quarm services...'
+    if ! sudo systemctl start quick-quarm.target; then
+        echo ''
+        echo '  ! ERROR: Failed to start services'
+        echo ''
+        echo '  Service status:'
+        systemctl status quick-quarm.target --no-pager -l || true
+        echo ''
+        echo '  Recent service logs:'
+        journalctl -u quick-quarm.target -n 30 --no-pager || true
+        echo ''
+        echo '  Individual service status:'
+        for service in eqemu-shared-memory eqemu-loginserver eqemu-ucs eqemu-queryserv eqemu-world eqemu-zone eqemu-boats; do
+            status=$(systemctl is-active $service.service 2>/dev/null || echo 'inactive')
+            echo "    $service.service: $status"
+            if [ "$status" != "active" ]; then
+                echo "      Recent errors:"
+                journalctl -u $service.service -n 5 --no-pager | grep -iE '(error|failed|Error|Failed|ERROR|FAILED)' | tail -3 | sed 's/^/        /' || echo "        (no errors found)"
+            fi
+        done
+        exit 1
+    fi
+    
+    # Wait for services to start
+    echo '  - Waiting for services to initialize...'
+    sleep 5
+    
+    # Verify services are actually running
+    if ! systemctl is-active --quiet quick-quarm.target; then
+        echo ''
+        echo '  ! ERROR: Services did not start properly'
+        echo ''
+        echo '  Service status:'
+        systemctl status quick-quarm.target --no-pager -l || true
+        echo ''
+        echo '  Recent service logs:'
+        journalctl -u quick-quarm.target -n 30 --no-pager || true
+        echo ''
+        echo '  Individual service failures:'
+        for service in eqemu-shared-memory eqemu-loginserver eqemu-ucs eqemu-queryserv eqemu-world eqemu-zone eqemu-boats; do
+            if ! systemctl is-active --quiet $service.service 2>/dev/null; then
+                echo "    $service.service: FAILED"
+                echo "      Status: $(systemctl is-active $service.service 2>/dev/null || echo 'inactive')"
+                echo "      Recent logs:"
+                journalctl -u $service.service -n 10 --no-pager | grep -iE '(error|failed|Error|Failed|ERROR|FAILED|cannot|Cannot|CANNOT)' | tail -3 | sed 's/^/        /' || echo "        (check logs manually)"
+            fi
+        done
+        exit 1
+    fi
+    echo '  + Services started successfully'
+fi
+
+# Final verification of all individual services
+echo '  - Verifying all services are running...'
+ALL_RUNNING=true
+for service in eqemu-shared-memory eqemu-loginserver eqemu-ucs eqemu-queryserv eqemu-world eqemu-zone eqemu-boats; do
+    if systemctl is-active --quiet $service.service 2>/dev/null; then
+        echo "    + $service.service: running"
+    else
+        echo "    ! $service.service: NOT running"
+        ALL_RUNNING=false
+    fi
+done
+
+if [ "$ALL_RUNNING" = "false" ]; then
+    echo ''
+    echo '  ! WARNING: Some services are not running'
+    echo '  Check logs with: sudo journalctl -u quick-quarm.target -f'
+    exit 1
+fi
 
 echo ''
 echo '===== INSTALLATION COMPLETE ====='
@@ -753,25 +1181,155 @@ echo "Server IP: {VMIPADDRESS}:6000"
     $installScript = $installScript -replace "`r`n", "`n" -replace "`r", "`n"
     [System.IO.File]::WriteAllText($scriptPath, $installScript, [System.Text.UTF8Encoding]::new($false))
     
-    # Copy script to VM (using port if specified)
+    # Wait for SSH service to be ready and test connection with retries
+    Write-Host "  - Waiting for SSH service to be ready (will retry for up to 8 minutes)..." -ForegroundColor Gray
+    $maxRetries = 48  # 48 retries * 10 seconds = 8 minutes max
+    $retryCount = 0
+    $sshSuccess = $false
+    
+    while ($retryCount -lt $maxRetries -and -not $sshSuccess) {
+        # First check if SSH port is open
+        $portOpen = $false
+        try {
+            $testPort = if ($sshPort -ne 22) { $sshPort } else { 22 }
+            $testHost = if ($sshPort -ne 22) { "localhost" } else { $sshHost }
+            $tcpTest = Test-NetConnection -ComputerName $testHost -Port $testPort -WarningAction SilentlyContinue -InformationLevel Quiet -ErrorAction SilentlyContinue
+            $portOpen = $tcpTest
+        }
+        catch {
+            $portOpen = $false
+        }
+        
+        if ($portOpen) {
+            # Port is open, try SSH key authentication
+            $testResult = & ssh -i $PrivateKeyPath -p $sshPort -o StrictHostKeyChecking=no -o UserKnownHostsFile=NUL -o ConnectTimeout=10 "${Username}@${sshHost}" "echo 'SSH test successful'" 2>&1
+            if ($LASTEXITCODE -eq 0 -and $testResult -match "SSH test successful") {
+                $sshSuccess = $true
+                Write-Host "  + SSH connection successful" -ForegroundColor Green
+            }
+            else {
+                $retryCount++
+                if ($retryCount -lt $maxRetries) {
+                    # Show more detailed progress
+                    if ($retryCount % 6 -eq 0) {
+                        $elapsed = [math]::Round($retryCount * 10 / 60, 1)
+                        Write-Host "    After $elapsed minutes: SSH port open but authentication failing (cloud-init still configuring)" -ForegroundColor Gray
+                    }
+                    Start-Sleep -Seconds 10
+                }
+            }
+        }
+        else {
+            # Port not open yet
+            $retryCount++
+            if ($retryCount -lt $maxRetries) {
+                if ($retryCount % 6 -eq 0) {
+                    $elapsed = [math]::Round($retryCount * 10 / 60, 1)
+                    Write-Host "    After $elapsed minutes: SSH port not ready yet (waiting for cloud-init)" -ForegroundColor Gray
+                }
+                Start-Sleep -Seconds 10
+            }
+        }
+    }
+    
+    if (-not $sshSuccess) {
+        Write-Host ""
+        Write-Host "═══════════════════════════════════════════════════════════════" -ForegroundColor Red
+        Write-Host "  SSH CONNECTION FAILED" -ForegroundColor Red
+        Write-Host "═══════════════════════════════════════════════════════════════" -ForegroundColor Red
+        Write-Host ""
+        Write-Host "  SSH key authentication failed after $maxRetries attempts (8 minutes)" -ForegroundColor Yellow
+        Write-Host "  This usually means cloud-init or SSH key injection encountered an issue." -ForegroundColor Yellow
+        Write-Host ""
+        Write-Host "  Last SSH output:" -ForegroundColor Gray
+        Write-Host "  $testResult" -ForegroundColor DarkGray
+        Write-Host ""
+        
+        # Try to get cloud-init status via password authentication if available
+        Write-Host "  Attempting to retrieve cloud-init logs for diagnosis..." -ForegroundColor Gray
+        try {
+            $cloudInitDiag = & plink -batch -ssh -P $sshPort -pw $Password "$Username@$sshHost" "sudo cloud-init status --long 2>&1; echo '---'; sudo tail -20 /var/log/cloud-init.log 2>&1" 2>&1
+            if ($LASTEXITCODE -eq 0) {
+                Write-Host ""
+                Write-Host "  Cloud-init status and recent logs:" -ForegroundColor Cyan
+                Write-Host "  ─────────────────────────────────────────────────────────────" -ForegroundColor DarkGray
+                $cloudInitDiag -split "`n" | ForEach-Object { Write-Host "  $_" -ForegroundColor DarkGray }
+                Write-Host "  ─────────────────────────────────────────────────────────────" -ForegroundColor DarkGray
+                Write-Host ""
+            }
+        }
+        catch {
+            Write-Host "  (Could not retrieve cloud-init logs automatically)" -ForegroundColor DarkGray
+        }
+        
+        Write-Host "  POSSIBLE CAUSES:" -ForegroundColor Yellow
+        Write-Host "  • Cloud-init failed to complete successfully" -ForegroundColor White
+        Write-Host "  • SSH key was not properly injected into authorized_keys" -ForegroundColor White
+        Write-Host "  • File permissions on /home/$Username/.ssh/ are incorrect" -ForegroundColor White
+        Write-Host "  • Network connectivity or port forwarding issue" -ForegroundColor White
+        Write-Host "  • VM disk ran out of space during initialization" -ForegroundColor White
+        Write-Host ""
+        Write-Host "  MANUAL TROUBLESHOOTING STEPS:" -ForegroundColor Cyan
+        Write-Host ""
+        Write-Host "  Step 1: Check cloud-init status via VM console" -ForegroundColor Yellow
+        Write-Host "    • Right-click VM '$VMName' in Hyper-V Manager → Connect" -ForegroundColor White
+        Write-Host "    • Login with username: $Username, password: $Password" -ForegroundColor White
+        Write-Host "    • Run: sudo cloud-init status --long" -ForegroundColor Gray
+        Write-Host "    • Check for errors: sudo tail -50 /var/log/cloud-init.log" -ForegroundColor Gray
+        Write-Host ""
+        Write-Host "  Step 2: Verify SSH key was injected" -ForegroundColor Yellow
+        Write-Host "    • Run: cat /home/$Username/.ssh/authorized_keys" -ForegroundColor Gray
+        Write-Host "    • Should contain: ssh-rsa ...quickquarm@hyperv" -ForegroundColor Gray
+        Write-Host "    • Check permissions: ls -la /home/$Username/.ssh/" -ForegroundColor Gray
+        Write-Host "    • Should be: drwx------ (700) and -rw------- (600)" -ForegroundColor Gray
+        Write-Host ""
+        Write-Host "  Step 3: Try password authentication" -ForegroundColor Yellow
+        Write-Host "    • Run: ssh -p $sshPort ${Username}@${sshHost}" -ForegroundColor Gray
+        Write-Host "    • Password: $Password" -ForegroundColor Gray
+        Write-Host "    • If this works, the issue is with SSH key authentication" -ForegroundColor Gray
+        Write-Host ""
+        Write-Host "  Step 4: Check system resources" -ForegroundColor Yellow
+        Write-Host "    • Run: df -h (check disk space)" -ForegroundColor Gray
+        Write-Host "    • Run: free -m (check memory)" -ForegroundColor Gray
+        Write-Host "    • Run: systemctl status ssh (check SSH service)" -ForegroundColor Gray
+        Write-Host ""
+        Write-Host "  For more help, check the Quick Quarm documentation or Discord." -ForegroundColor Cyan
+        Write-Host "═══════════════════════════════════════════════════════════════" -ForegroundColor Red
+        Write-Host ""
+        exit 1
+    }
+    
+    # Verify cloud-init completed successfully
+    Write-Host "  - Verifying cloud-init completed..." -ForegroundColor Gray
+    $cloudInitCmd = if ($sshPort -ne 22) {
+        "ssh -i $PrivateKeyPath -p $sshPort -o StrictHostKeyChecking=no -o UserKnownHostsFile=NUL `"${Username}@${sshHost}`" `"cloud-init status --wait`""
+    } else {
+        "ssh -i $PrivateKeyPath -o StrictHostKeyChecking=no -o UserKnownHostsFile=NUL `"${Username}@${sshHost}`" `"cloud-init status --wait`""
+    }
+    
+    $cloudInitResult = Invoke-Expression $cloudInitCmd 2>&1
+    if ($LASTEXITCODE -eq 0) {
+        Write-Host "  + Cloud-init completed successfully" -ForegroundColor Green
+    } else {
+        Write-Host "  ! Warning: Cloud-init status check failed" -ForegroundColor Yellow
+        Write-Host "  Continuing anyway..." -ForegroundColor Gray
+    }
+    
+    # Copy script to VM
     Write-Host "  - Copying installation script to VM..." -ForegroundColor Gray
-    if ($sshPort -ne 22) {
-        scp -i $PrivateKeyPath -P $sshPort -o StrictHostKeyChecking=no -o UserKnownHostsFile=NUL $scriptPath "${Username}@${sshHost}:/tmp/install_qq.sh"
+    & scp -i $PrivateKeyPath -P $sshPort -o StrictHostKeyChecking=no -o UserKnownHostsFile=NUL $scriptPath "${Username}@${sshHost}:/tmp/install_qq.sh" 2>&1 | Out-Null
+    
+    if ($LASTEXITCODE -ne 0) {
+        Write-Host "  ! ERROR: Failed to copy installation script to VM" -ForegroundColor Red
+        exit 1
     }
-    else {
-        scp -i $PrivateKeyPath -o StrictHostKeyChecking=no -o UserKnownHostsFile=NUL $scriptPath "${Username}@${sshHost}:/tmp/install_qq.sh"
-    }
+    Write-Host "  + Installation script copied" -ForegroundColor Green
     
     # Make script executable and run it
     Write-Host "  - Executing installation on VM..." -ForegroundColor Gray
     Write-Host ""
     
-    if ($sshPort -ne 22) {
-        ssh -i $PrivateKeyPath -p $sshPort -o StrictHostKeyChecking=no -o UserKnownHostsFile=NUL "${Username}@${sshHost}" "chmod +x /tmp/install_qq.sh && /tmp/install_qq.sh"
-    }
-    else {
-        ssh -i $PrivateKeyPath -o StrictHostKeyChecking=no -o UserKnownHostsFile=NUL "${Username}@${sshHost}" "chmod +x /tmp/install_qq.sh && /tmp/install_qq.sh"
-    }
+    & ssh -i $PrivateKeyPath -p $sshPort -o StrictHostKeyChecking=no -o UserKnownHostsFile=NUL "${Username}@${sshHost}" "chmod +x /tmp/install_qq.sh && /tmp/install_qq.sh"
     
     # Cleanup
     Remove-Item $scriptPath -Force
@@ -783,8 +1341,7 @@ echo "Server IP: {VMIPADDRESS}:6000"
 # Main installation process
 try {
     # Check if running as administrator
-    $currentPrincipal = New-Object Security.Principal.WindowsPrincipal([Security.Principal.WindowsIdentity]::GetCurrent())
-    if (-not $currentPrincipal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
+    if (-not (Test-Administrator)) {
         Write-Host "ERROR: This script must be run as Administrator" -ForegroundColor Red
         Write-Host "Right-click PowerShell and select 'Run as Administrator'" -ForegroundColor Yellow
         exit 1
@@ -823,20 +1380,84 @@ try {
     # Convert to VHDX
     Convert-ImageToVHDX -SourceImage $ubuntuImage -DestVHDX $vhdxPath
     
+    # Auto-detect Default Switch network if static IP not provided
+    $networkConfig = $null
+    if ([string]::IsNullOrEmpty($StaticIP) -or [string]::IsNullOrEmpty($Gateway) -or [string]::IsNullOrEmpty($Netmask)) {
+        Write-Host '[STEP 6/8] Auto-detecting Default Switch network...' -ForegroundColor Yellow
+        $networkConfig = Get-DefaultSwitchNetworkConfig -PreferredHostID 100
+        
+        if ($networkConfig) {
+            # Use auto-detected values if not provided
+            if ([string]::IsNullOrEmpty($StaticIP)) {
+                $StaticIP = $networkConfig.StaticIP
+            }
+            if ([string]::IsNullOrEmpty($Gateway)) {
+                $Gateway = $networkConfig.Gateway
+            }
+            if ([string]::IsNullOrEmpty($Netmask)) {
+                $Netmask = $networkConfig.Netmask
+            }
+            Write-Host "  + Using static IP: $StaticIP/$($networkConfig.PrefixLength)" -ForegroundColor Green
+            Write-Host "  + Gateway: $Gateway" -ForegroundColor Green
+        }
+        else {
+            Write-Host "  ! Could not auto-detect network, will use DHCP" -ForegroundColor Yellow
+        }
+    }
+    else {
+        Write-Host '[STEP 6/8] Using provided static IP configuration...' -ForegroundColor Yellow
+        Write-Host "  + Static IP: $StaticIP" -ForegroundColor Green
+        Write-Host "  + Gateway: $Gateway" -ForegroundColor Green
+    }
+    
     # Create cloud-init ISO with SSH key
-    New-CloudInitISO -ISOPath $cloudInitISO -PublicKeyPath "$sshKeyPath.pub" -Username $InstallUser -Password $InstallPassword
+    New-CloudInitISO -ISOPath $cloudInitISO -PublicKeyPath "$sshKeyPath.pub" -Username $InstallUser -Password $InstallPassword -StaticIP $StaticIP -Gateway $Gateway -Netmask $Netmask -DNS $DNS
     
     # Create VM
     $vm = New-QuickQuarmVM -Name $VMName -VHDPath $vhdxPath -CloudInitISO $cloudInitISO -Memory $VMMemory -ProcessorCount $VMProcessors
     
-    # Start VM and wait for SSH
-    $vmConnection = Start-VMAndWaitForSSH -VMName $VMName -TimeoutSeconds 300
+    # Start VM and wait for SSH (pass static IP if configured)
+    $vmConnection = Start-VMAndWaitForSSH -VMName $VMName -TimeoutSeconds 300 -StaticIP $StaticIP -SSHKeyPath $sshKeyPath -Username $InstallUser
     
     if (-not $vmConnection) {
         Write-Host ""
-        Write-Host "Failed to get VM IP address or SSH is not responding" -ForegroundColor Red
-        Write-Host "You can try to connect manually later using:" -ForegroundColor Yellow
-        Write-Host "  ssh -i `"$sshKeyPath`" ${InstallUser}@<VM_IP>" -ForegroundColor Gray
+        Write-Host "═══════════════════════════════════════════════════════════════" -ForegroundColor Red
+        Write-Host "  VM CONNECTION FAILED" -ForegroundColor Red
+        Write-Host "═══════════════════════════════════════════════════════════════" -ForegroundColor Red
+        Write-Host ""
+        Write-Host "  Could not detect VM IP address or SSH port is not responding" -ForegroundColor Yellow
+        Write-Host ""
+        Write-Host "  POSSIBLE CAUSES:" -ForegroundColor Yellow
+        Write-Host "  • VM failed to boot or is still booting" -ForegroundColor White
+        Write-Host "  • Network adapter configuration issue" -ForegroundColor White
+        Write-Host "  • Hyper-V Default Switch not functioning properly" -ForegroundColor White
+        Write-Host "  • DHCP not working (if not using static IP)" -ForegroundColor White
+        Write-Host "  • VM disk image is corrupted" -ForegroundColor White
+        Write-Host ""
+        Write-Host "  MANUAL TROUBLESHOOTING:" -ForegroundColor Cyan
+        Write-Host ""
+        Write-Host "  Step 1: Check VM status in Hyper-V Manager" -ForegroundColor Yellow
+        Write-Host "    • Open Hyper-V Manager" -ForegroundColor White
+        Write-Host "    • Check if VM '$VMName' is running" -ForegroundColor White
+        Write-Host "    • Right-click → Connect to open console" -ForegroundColor White
+        Write-Host ""
+        Write-Host "  Step 2: Verify network connectivity from VM console" -ForegroundColor Yellow
+        Write-Host "    • Login to VM console (username: $InstallUser, password: $InstallPassword)" -ForegroundColor White
+        Write-Host "    • Run: ip addr show (check for IP address)" -ForegroundColor Gray
+        Write-Host "    • Run: ping -c 4 8.8.8.8 (test internet connectivity)" -ForegroundColor Gray
+        Write-Host "    • Run: systemctl status ssh (verify SSH is running)" -ForegroundColor Gray
+        Write-Host ""
+        Write-Host "  Step 3: Check Hyper-V networking" -ForegroundColor Yellow
+        Write-Host "    • In PowerShell (as Admin), run:" -ForegroundColor White
+        Write-Host "      Get-VMNetworkAdapter -VMName '$VMName'" -ForegroundColor Gray
+        Write-Host "      Get-NetIPAddress -InterfaceAlias 'vEthernet (Default Switch)'" -ForegroundColor Gray
+        Write-Host ""
+        Write-Host "  Step 4: Try manual SSH connection" -ForegroundColor Yellow
+        Write-Host "    • From VM console, get IP: ip addr show | grep 'inet '" -ForegroundColor Gray
+        Write-Host "    • From Windows, try: ssh -i `"$sshKeyPath`" ${InstallUser}@<VM_IP>" -ForegroundColor Gray
+        Write-Host ""
+        Write-Host "═══════════════════════════════════════════════════════════════" -ForegroundColor Red
+        Write-Host ""
         exit 1
     }
     
@@ -844,10 +1465,92 @@ try {
     $vmActualIP = $vmConnection.ActualIP
     
     # Install Quick Quarm via SSH
-    Install-QuickQuarmViaSSH -VMIPAddress $sshConnection -ActualVMIP $vmActualIP -Username $InstallUser -PrivateKeyPath $sshKeyPath -RepoUrl $RepoUrl -DBHost $DBHost -DBName $DBName -DBUser $DBUser -DBPassword $DBPassword
+    Install-QuickQuarmViaSSH -VMIPAddress $sshConnection -ActualVMIP $vmActualIP -Username $InstallUser -Password $InstallPassword -PrivateKeyPath $sshKeyPath -RepoUrl $RepoUrl -DBHost $DBHost -DBName $DBName -DBUser $DBUser -DBPassword $DBPassword
+    
+    # Wait a moment for services to fully start after installation
+    Write-Host ""
+    Write-Host "Waiting for services to initialize..." -ForegroundColor Yellow
+    Start-Sleep -Seconds 10
     
     # Verify installation
-    & "$PSScriptRoot\verify-install.ps1" -VMIP $vmActualIP -SSHKeyPath $sshKeyPath -Username $InstallUser -DBUser $DBUser -DBPassword $DBPassword
+    Write-Host ""
+    Write-Host "Verifying installation..." -ForegroundColor Yellow
+    try {
+        & "$PSScriptRoot\QuarmFixer-HyperV.ps1" -Action Verify -VMName $VMName -SSHKeyPath $sshKeyPath -VMUser $InstallUser -DBUser $DBUser -DBPassword $DBPassword
+        if ($LASTEXITCODE -ne 0) {
+            Write-Host ""
+            Write-Host "Verification failed. Attempting to start services..." -ForegroundColor Yellow
+            & "$PSScriptRoot\QuarmFixer-HyperV.ps1" -Action Start -VMName $VMName -SSHKeyPath $sshKeyPath -VMUser $InstallUser
+            Write-Host ""
+            Write-Host "Re-running verification..." -ForegroundColor Yellow
+            & "$PSScriptRoot\QuarmFixer-HyperV.ps1" -Action Verify -VMName $VMName -SSHKeyPath $sshKeyPath -VMUser $InstallUser -DBUser $DBUser -DBPassword $DBPassword
+            if ($LASTEXITCODE -ne 0) {
+                Write-Host ""
+                Write-Host "WARNING: Verification still failed after attempting to start services." -ForegroundColor Yellow
+                Write-Host "Services may need manual attention. Check logs with:" -ForegroundColor Yellow
+                Write-Host "  .\QuarmFixer-HyperV.ps1 -Action Logs" -ForegroundColor Cyan
+                Write-Host ""
+            }
+        }
+    }
+    catch {
+        Write-Host ""
+        Write-Host "WARNING: Verification encountered an error: $($_.Exception.Message)" -ForegroundColor Yellow
+        Write-Host "You can manually verify and start services with:" -ForegroundColor Yellow
+        Write-Host "  .\QuarmFixer-HyperV.ps1 -Action Start" -ForegroundColor Cyan
+        Write-Host ""
+    }
+    
+    # Set up game port forwarding and firewall rules
+    Write-Host ""
+    Write-Host "Setting up port forwarding for game ports..." -ForegroundColor Yellow
+    $portCount = Set-PortForwarding -VMIP $vmActualIP -VerifyConnectivity
+    if ($portCount -gt 0) {
+        Write-Host "  + Port forwarding configured for $portCount port(s)" -ForegroundColor Green
+    } else {
+        Write-Host "  ! Warning: Port forwarding configuration had issues" -ForegroundColor Yellow
+        Write-Host "    You may need to manually configure port forwarding" -ForegroundColor Yellow
+    }
+    
+    Write-Host "Configuring Windows Firewall..." -ForegroundColor Yellow
+    $firewallCount = Set-FirewallRules
+    if ($firewallCount -gt 0) {
+        Write-Host "  + Firewall rules configured for $firewallCount port(s)" -ForegroundColor Green
+    } else {
+        Write-Host "  ! Warning: Firewall configuration had issues" -ForegroundColor Yellow
+    }
+    
+    # Get Windows host IP for client configuration
+    $hostIP = Get-WindowsHostIPv4
+    
+    # Save VM configuration for other scripts to use
+    if (-not [string]::IsNullOrEmpty($StaticIP)) {
+        $configFile = Join-Path $workDir "vm-config.json"
+        $vmConfig = @{
+            VMName = $VMName
+            StaticIP = $StaticIP
+            Gateway = $Gateway
+            Netmask = $Netmask
+            DNS = $DNS
+            ActualIP = $vmActualIP
+            SSHKeyPath = $sshKeyPath
+            InstallUser = $InstallUser
+            InstallPassword = $InstallPassword
+            DBUser = $DBUser
+            DBPassword = $DBPassword
+            DBHost = $DBHost
+            DBName = $DBName
+        }
+        
+        # Add network config if auto-detected
+        if ($networkConfig) {
+            $vmConfig.Network = $networkConfig.Network
+            $vmConfig.PrefixLength = $networkConfig.PrefixLength
+        }
+        
+        $vmConfig | ConvertTo-Json | Out-File -FilePath $configFile -Encoding UTF8
+        Write-Host "  + VM configuration saved to: $configFile" -ForegroundColor Gray
+    }
     
     # Final output
     Write-Host ""
@@ -861,13 +1564,20 @@ try {
     Write-Host "  Server Address: ${vmActualIP}:6000" -ForegroundColor White
     Write-Host "  SSH Key: $sshKeyPath" -ForegroundColor White
     Write-Host "  SSH Port Forward: localhost:2222 -> ${vmActualIP}:22" -ForegroundColor White
+    Write-Host "  Game Port Forwarding: Configured (ports 6000, 5998, 9000)" -ForegroundColor White
+    Write-Host "  Windows Firewall: Configured" -ForegroundColor White
     Write-Host ""
     Write-Host "To connect to VM via SSH:" -ForegroundColor Cyan
     Write-Host "  ssh -i `"$sshKeyPath`" -p 2222 ${InstallUser}@localhost" -ForegroundColor White
     Write-Host ""
     Write-Host "Next steps:" -ForegroundColor Cyan
     Write-Host "1. Download TAKP v2.2 Client from PQ Discord #server-files" -ForegroundColor White
-    Write-Host "2. Edit eqhost.txt and change server to: ${vmIP}:6000" -ForegroundColor White
+    if ($hostIP) {
+        Write-Host "2. Edit eqhost.txt and change server to: ${hostIP}:6000" -ForegroundColor White
+    } else {
+        Write-Host "2. Edit eqhost.txt and change server to: ${vmActualIP}:6000" -ForegroundColor White
+        Write-Host "   (Note: Port forwarding configured, but host IP could not be detected)" -ForegroundColor Yellow
+    }
     Write-Host "3. Run the client and login with any username/password" -ForegroundColor White
     Write-Host "4. Select your Quick Quarm server and create a character" -ForegroundColor White
     Write-Host ""
@@ -881,3 +1591,7 @@ catch {
     exit 1
 }
 
+} finally {
+    # Stop transcript logging
+    Stop-Transcript
+}
